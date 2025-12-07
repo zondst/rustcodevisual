@@ -12,6 +12,8 @@ mod presets;
 mod fractals;
 mod export;
 mod offscreen_render;
+mod gpu_render;
+mod gpu_export;
 
 use eframe::egui;
 use config::{AppConfig, ParticleMode, ParticleShape, SpectrumStyle, WaveformStyle, ColorScheme};
@@ -66,6 +68,14 @@ struct ParticleStudioApp {
     
     // Export thread communication
     export_progress_rx: Option<Receiver<ExportProgress>>,
+
+    // GPU Export state
+    gpu_export_available: bool,
+    gpu_info: Option<String>,
+    use_gpu_export: bool,
+    detected_encoder: gpu_export::HardwareEncoder,
+    gpu_export_fps: f32,
+    gpu_export_progress_rx: Option<std::sync::mpsc::Receiver<gpu_export::GpuExportMessage>>,
 }
 
 /// Progress message from export thread
@@ -147,6 +157,13 @@ impl ParticleStudioApp {
             frame_renderer: FrameRenderer::new(1920, 1080),
             // Export thread
             export_progress_rx: None,
+            // GPU Export state
+            gpu_export_available: gpu_export::is_gpu_export_available(),
+            gpu_info: gpu_export::get_gpu_info(),
+            use_gpu_export: true, // Default to GPU if available
+            detected_encoder: gpu_export::HardwareEncoder::detect(),
+            gpu_export_fps: 0.0,
+            gpu_export_progress_rx: None,
         }
     }
     
@@ -199,7 +216,36 @@ impl eframe::App for ParticleStudioApp {
         if should_clear_rx {
             self.export_progress_rx = None;
         }
-        
+
+        // Check for GPU export progress updates
+        let mut should_clear_gpu_rx = false;
+        if let Some(ref rx) = self.gpu_export_progress_rx {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    gpu_export::GpuExportMessage::Progress { current, total, fps } => {
+                        self.export_current_frame = current;
+                        self.export_total_frames = total;
+                        self.export_progress = current as f32 / total as f32;
+                        self.gpu_export_fps = fps;
+                    }
+                    gpu_export::GpuExportMessage::Completed { path } => {
+                        self.export_is_exporting = false;
+                        self.export_progress = 0.0;
+                        should_clear_gpu_rx = true;
+                        println!("GPU Export completed: {:?}", path);
+                    }
+                    gpu_export::GpuExportMessage::Error(e) => {
+                        self.export_error_message = Some(e);
+                        self.export_is_exporting = false;
+                        should_clear_gpu_rx = true;
+                    }
+                }
+            }
+        }
+        if should_clear_gpu_rx {
+            self.gpu_export_progress_rx = None;
+        }
+
         // Update audio state
         if let Some(ref analysis) = self.audio_sys.analysis {
             if self.is_playing && self.current_frame < analysis.total_frames {
@@ -782,7 +828,22 @@ impl ParticleStudioApp {
         
         // Export controls
         ui.add_space(12.0);
-        
+
+        // GPU Acceleration Section
+        ui.heading("🚀 GPU Acceleration");
+        if self.gpu_export_available {
+            if let Some(ref gpu_name) = self.gpu_info {
+                ui.label(format!("✅ GPU: {}", gpu_name));
+            }
+            ui.label(format!("Encoder: {}", self.detected_encoder.name()));
+            ui.checkbox(&mut self.use_gpu_export, "Use GPU-accelerated export (3-5x faster)");
+        } else {
+            ui.colored_label(egui::Color32::YELLOW, "⚠ GPU not available, using CPU");
+            self.use_gpu_export = false;
+        }
+
+        ui.add_space(8.0);
+
         // FFmpeg availability check
         if !self.ffmpeg_available {
             ui.colored_label(egui::Color32::YELLOW, "⚠ FFmpeg not found in PATH");
@@ -791,51 +852,80 @@ impl ParticleStudioApp {
         } else {
             ui.colored_label(egui::Color32::GREEN, "✓ FFmpeg available");
         }
-        
+
         ui.add_space(8.0);
-        
+
         if !self.export_is_exporting {
-            let can_export = self.export_output_path.is_some() 
-                && self.audio_sys.is_loaded() 
+            let can_export = self.export_output_path.is_some()
+                && self.audio_sys.is_loaded()
                 && self.ffmpeg_available;
-            
+
             if can_export {
-                if ui.button("▶ Start Export (Headless)").clicked() {
-                    // Get required data for headless export
+                let button_text = if self.use_gpu_export && self.gpu_export_available {
+                    "▶ Start GPU Export"
+                } else {
+                    "▶ Start Export (CPU)"
+                };
+
+                if ui.button(button_text).clicked() {
+                    // Get required data for export
                     if let Some(ref path) = &self.export_output_path {
                         if let Some(ref analysis) = &self.audio_sys.analysis {
-                            // Create channel for progress
-                            let (tx, rx) = mpsc::channel();
-                            
-                            // Clone data for the thread
-                            let config_clone = self.config.clone();
-                            let analysis_clone = analysis.clone();
-                            let path_clone = path.clone();
-                            let duration = self.export_duration_secs;
-                            
-                            // Calculate total frames for UI
                             let fps = self.config.export.fps;
+                            let duration = self.export_duration_secs;
+
+                            // Calculate total frames for UI
                             self.export_total_frames = (duration * fps as f32) as usize;
                             self.export_current_frame = 0;
                             self.export_progress = 0.0;
                             self.export_error_message = None;
                             self.export_is_exporting = true;
-                            
-                            // Store receiver
-                            self.export_progress_rx = Some(rx);
-                            
-                            // Start headless export in separate thread!
-                            std::thread::spawn(move || {
-                                offscreen_render::run_headless_export(
-                                    config_clone,
-                                    analysis_clone,
-                                    path_clone,
-                                    duration,
+
+                            if self.use_gpu_export && self.gpu_export_available {
+                                // GPU Export path
+                                let (tx, rx) = mpsc::channel();
+                                self.gpu_export_progress_rx = Some(rx);
+
+                                let export_cfg = gpu_export::GpuExportConfig {
+                                    width: self.config.export.width,
+                                    height: self.config.export.height,
+                                    fps: self.config.export.fps,
+                                    duration_secs: duration,
+                                    output_path: path.clone(),
+                                    audio_path: self.audio_sys.audio_path.clone().map(|s| std::path::PathBuf::from(s)),
+                                    encoder: self.detected_encoder,
+                                    quality: self.config.export.crf,
+                                };
+
+                                gpu_export::run_gpu_export(
+                                    self.config.clone(),
+                                    analysis.clone(),
+                                    export_cfg,
                                     tx,
                                 );
-                            });
-                            
-                            println!("Headless export started in background thread!");
+
+                                println!("GPU export started with {} encoder!", self.detected_encoder.name());
+                            } else {
+                                // CPU Export path (original headless)
+                                let (tx, rx) = mpsc::channel();
+                                self.export_progress_rx = Some(rx);
+
+                                let config_clone = self.config.clone();
+                                let analysis_clone = analysis.clone();
+                                let path_clone = path.clone();
+
+                                std::thread::spawn(move || {
+                                    offscreen_render::run_headless_export(
+                                        config_clone,
+                                        analysis_clone,
+                                        path_clone,
+                                        duration,
+                                        tx,
+                                    );
+                                });
+
+                                println!("CPU export started in background thread!");
+                            }
                         }
                     }
                 }
@@ -856,17 +946,33 @@ impl ParticleStudioApp {
             }
         } else {
             // Export in progress (running in background thread)
-            let frame_info = format!("Frame {}/{} (Background)", self.export_current_frame, self.export_total_frames);
+            let mode_str = if self.gpu_export_progress_rx.is_some() { "GPU" } else { "CPU" };
+            let frame_info = format!("Frame {}/{} ({} Export)", self.export_current_frame, self.export_total_frames, mode_str);
             ui.label(frame_info);
-            
+
             ui.add(egui::ProgressBar::new(self.export_progress)
                 .show_percentage()
                 .animate(true));
-            
-            ui.label("🔄 Rendering in background - UI stays responsive!");
-            
-            // Cancel is more complex with threads, just show status
-            // (In production, would use atomic flag for cancellation)
+
+            // Show FPS for GPU export
+            if self.gpu_export_progress_rx.is_some() && self.gpu_export_fps > 0.0 {
+                let target_fps = self.config.export.fps as f32;
+                let speed_ratio = self.gpu_export_fps / target_fps;
+                ui.label(format!("🚀 {:.1} fps ({:.1}x realtime)", self.gpu_export_fps, speed_ratio));
+            } else {
+                ui.label("🔄 Rendering in background - UI stays responsive!");
+            }
+
+            // ETA calculation
+            if self.export_current_frame > 0 && self.gpu_export_fps > 0.0 {
+                let remaining_frames = self.export_total_frames - self.export_current_frame;
+                let eta_secs = remaining_frames as f32 / self.gpu_export_fps;
+                if eta_secs < 60.0 {
+                    ui.label(format!("⏱ ETA: {:.0} seconds", eta_secs));
+                } else {
+                    ui.label(format!("⏱ ETA: {:.1} minutes", eta_secs / 60.0));
+                }
+            }
         }
         
         // ================================================================

@@ -29,6 +29,13 @@ rayon = "1.8"
 # Utility
 bytemuck = { version = "1.14", features = ["derive"] }
 
+# GPU Rendering (wgpu for headless GPU acceleration)
+wgpu = "27.0"
+pollster = "0.4"       # Minimal async executor for wgpu
+
+# Video encoding
+ffmpeg-sidecar = "2.0" # FFmpeg CLI wrapper for NVENC encoding
+
 [profile.release]
 opt-level = 3
 lto = true
