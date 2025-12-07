@@ -6,6 +6,7 @@ use crate::audio::{AudioState, NormalizedAudio};
 use egui::{Color32, Painter, Pos2, Vec2, Rect};
 use rand::Rng;
 use std::f32::consts::PI;
+use rayon::prelude::*;
 
 /// Individual particle data
 #[derive(Clone)]
@@ -159,11 +160,22 @@ impl ParticleEngine {
         }
         
         let speed_factor = config.speed * 60.0 * dt;
+
+        // Apply mode-specific forces
+        match config.mode {
+            ParticleMode::Chaos => self.update_chaos(config, audio, dt, speed_factor),
+            ParticleMode::Calm => self.update_calm(config, audio, dt, speed_factor),
+            ParticleMode::Cinematic => self.update_cinematic(config, audio, dt, speed_factor),
+            ParticleMode::Orbit => self.update_orbit(config, audio, dt, speed_factor),
+        }
         
         // ========================================================
         // RULE 3: Update all particles with audio-physics
         // ========================================================
-        for p in &mut self.particles {
+        let width = self.width;
+        let height = self.height;
+        
+        self.particles.par_iter_mut().for_each(|p| {
             // -- BEAT PHYSICS: Velocity burst away from center --
             if is_strong_beat && config.beat_burst_strength > 0.0 {
                 let dir = Vec2::new(p.pos.x - center.x, p.pos.y - center.y);
@@ -236,11 +248,11 @@ impl ParticleEngine {
             };
             
             // Wrap around screen
-            if p.pos.x < -50.0 { p.pos.x = self.width + 50.0; }
-            if p.pos.x > self.width + 50.0 { p.pos.x = -50.0; }
-            if p.pos.y < -50.0 { p.pos.y = self.height + 50.0; }
-            if p.pos.y > self.height + 50.0 { p.pos.y = -50.0; }
-        }
+            if p.pos.x < -50.0 { p.pos.x = width + 50.0; }
+            if p.pos.x > width + 50.0 { p.pos.x = -50.0; }
+            if p.pos.y < -50.0 { p.pos.y = height + 50.0; }
+            if p.pos.y > height + 50.0 { p.pos.y = -50.0; }
+        });
         
         // ========================================================
         // RULE 4: Remove particles when fully faded or dead
@@ -307,14 +319,15 @@ impl ParticleEngine {
         self.particles.push(particle);
     }
     
-    fn update_chaos(&mut self, config: &ParticleConfig, audio: &AudioState, dt: f32, speed_factor: f32) {
+    fn update_chaos(&mut self, config: &ParticleConfig, audio: &AudioState, _dt: f32, speed_factor: f32) {
         let center = Vec2::new(self.width / 2.0, self.height / 2.0);
+        let flow_field_time = self.flow_field_time;
         
-        for p in &mut self.particles {
+        self.particles.par_iter_mut().for_each(|p| {
             // Curl noise flow field
             let noise_scale = 0.003;
-            let nx = p.pos.x * noise_scale + self.flow_field_time;
-            let ny = p.pos.y * noise_scale + self.flow_field_time * 0.7;
+            let nx = p.pos.x * noise_scale + flow_field_time;
+            let ny = p.pos.y * noise_scale + flow_field_time * 0.7;
             
             let flow_x = (ny * 6.0).sin() + (nx * 3.0).cos() * 0.5;
             let flow_y = (nx * 6.0).cos() + (ny * 3.0).sin() * 0.5;
@@ -338,13 +351,14 @@ impl ParticleEngine {
             
             // Gravity
             p.vel.y += config.gravity * speed_factor * 0.5;
-        }
+        });
     }
     
-    fn update_calm(&mut self, config: &ParticleConfig, audio: &AudioState, dt: f32, speed_factor: f32) {
-        for p in &mut self.particles {
+    fn update_calm(&mut self, _config: &ParticleConfig, audio: &AudioState, _dt: f32, speed_factor: f32) {
+        let time = self.time;
+        self.particles.par_iter_mut().for_each(|p| {
             // Gentle floating motion
-            let float_x = (self.time * 0.5 + p.pos.y * 0.01).sin() * 0.02;
+            let float_x = (time * 0.5 + p.pos.y * 0.01).sin() * 0.02;
             let float_y = -0.02 - audio.amplitude * 0.03;
             
             p.vel.x += float_x * speed_factor;
@@ -355,29 +369,30 @@ impl ParticleEngine {
             
             // Gravity (upward drift in calm mode)
             p.vel.y -= 0.01 * speed_factor;
-        }
+        });
     }
     
-    fn update_cinematic(&mut self, config: &ParticleConfig, audio: &AudioState, dt: f32, speed_factor: f32) {
-        for p in &mut self.particles {
+    fn update_cinematic(&mut self, _config: &ParticleConfig, audio: &AudioState, _dt: f32, speed_factor: f32) {
+        let time = self.time;
+        self.particles.par_iter_mut().for_each(|p| {
             // Very slow, smooth motion
-            let breathing = (self.time * 0.3 + p.pos.x * 0.001).sin();
+            let breathing = (time * 0.3 + p.pos.x * 0.001).sin();
             
             p.vel.x += breathing * 0.005 * speed_factor;
-            p.vel.y += (self.time * 0.2).cos() * 0.003 * speed_factor;
+            p.vel.y += (time * 0.2).cos() * 0.003 * speed_factor;
             
             // High damping
             p.vel *= 0.95;
             
             // Size breathing effect is more pronounced
             p.size = p.base_size * (1.0 + breathing * 0.3 + audio.amplitude * 0.4);
-        }
+        });
     }
     
-    fn update_orbit(&mut self, config: &ParticleConfig, audio: &AudioState, dt: f32, speed_factor: f32) {
+    fn update_orbit(&mut self, config: &ParticleConfig, audio: &AudioState, _dt: f32, speed_factor: f32) {
         let center = Vec2::new(self.width / 2.0, self.height / 2.0);
         
-        for p in &mut self.particles {
+        self.particles.par_iter_mut().for_each(|p| {
             let dx = p.pos.x - center.x;
             let dy = p.pos.y - center.y;
             let dist = (dx * dx + dy * dy).sqrt().max(1.0);
@@ -397,7 +412,7 @@ impl ParticleEngine {
             
             // Moderate damping
             p.vel *= 0.97;
-        }
+        });
     }
     
     fn spawn_particle(&mut self, config: &ParticleConfig, rng: &mut rand::rngs::ThreadRng) {

@@ -195,8 +195,25 @@ pub fn run_gpu_export(
 ) {
     // Spawn export thread
     thread::spawn(move || {
-        if let Err(e) = run_gpu_export_impl(app_config, audio_analysis, export_config, &progress_tx) {
-            let _ = progress_tx.send(GpuExportMessage::Error(e));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_gpu_export_impl(app_config, audio_analysis, export_config, &progress_tx)
+        }));
+        
+        match result {
+            Ok(Ok(())) => {},
+            Ok(Err(e)) => {
+                let _ = progress_tx.send(GpuExportMessage::Error(e));
+            }
+            Err(panic_info) => {
+                let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    format!("Export thread panicked: {}", s)
+                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                    format!("Export thread panicked: {}", s)
+                } else {
+                    "Export thread panicked with unknown error".to_string()
+                };
+                let _ = progress_tx.send(GpuExportMessage::Error(msg));
+            }
         }
     });
 }

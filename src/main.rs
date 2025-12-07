@@ -25,6 +25,7 @@ use export::VideoExporter;
 use offscreen_render::FrameRenderer;
 use std::time::Instant;
 use std::sync::mpsc::{self, Receiver};
+use offscreen_render::ExportMessage;
 
 /// Main application state
 struct ParticleStudioApp {
@@ -67,7 +68,7 @@ struct ParticleStudioApp {
     frame_renderer: FrameRenderer,
     
     // Export thread communication
-    export_progress_rx: Option<Receiver<ExportProgress>>,
+    export_progress_rx: Option<Receiver<ExportMessage>>,
 
     // GPU Export state
     gpu_export_available: bool,
@@ -78,12 +79,7 @@ struct ParticleStudioApp {
     gpu_export_progress_rx: Option<std::sync::mpsc::Receiver<gpu_export::GpuExportMessage>>,
 }
 
-/// Progress message from export thread
-enum ExportProgress {
-    Frame(usize, usize),  // current, total
-    Done,
-    Error(String),
-}
+
 
 #[derive(Clone, Copy, PartialEq)]
 enum ExportFormat {
@@ -194,18 +190,18 @@ impl eframe::App for ParticleStudioApp {
         if let Some(ref rx) = self.export_progress_rx {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
-                    ExportProgress::Frame(current, total) => {
+                    ExportMessage::Progress(current, total) => {
                         self.export_current_frame = current;
                         self.export_total_frames = total;
                         self.export_progress = current as f32 / total as f32;
                     }
-                    ExportProgress::Done => {
+                    ExportMessage::Completed => {
                         self.export_is_exporting = false;
                         self.export_progress = 0.0;
                         should_clear_rx = true;
                         println!("Export completed!");
                     }
-                    ExportProgress::Error(e) => {
+                    ExportMessage::Error(e) => {
                         self.export_error_message = Some(e);
                         self.export_is_exporting = false;
                         should_clear_rx = true;
@@ -897,9 +893,20 @@ impl ParticleStudioApp {
                                     quality: self.config.export.crf,
                                 };
 
+
+                                println!("=== GPU EXPORT DEBUG ===");
+                                println!("GPU available: {}", self.gpu_export_available);
+                                println!("GPU info: {:?}", self.gpu_info);
+                                println!("Encoder: {:?}", self.detected_encoder.name());
+                                println!("FFmpeg available: {}", self.ffmpeg_available);
+                                println!("Export path: {:?}", path);
+                                println!("Resolution: {}x{}", self.config.export.width, self.config.export.height);
+                                println!("Duration: {} secs", duration);
+                                println!("========================");
+
                                 gpu_export::run_gpu_export(
                                     self.config.clone(),
-                                    analysis.clone(),
+                                    (**analysis).clone(),
                                     export_cfg,
                                     tx,
                                 );
@@ -911,7 +918,7 @@ impl ParticleStudioApp {
                                 self.export_progress_rx = Some(rx);
 
                                 let config_clone = self.config.clone();
-                                let analysis_clone = analysis.clone();
+                                let analysis_clone = (**analysis).clone();
                                 let path_clone = path.clone();
 
                                 std::thread::spawn(move || {

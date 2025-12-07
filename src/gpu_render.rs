@@ -144,12 +144,11 @@ impl GpuRenderer {
                     label: Some("GPU Renderer Device"),
                     required_features: wgpu::Features::empty(),
                     required_limits: wgpu::Limits {
-                        max_texture_dimension_2d: 8192,
-                        max_storage_buffer_binding_size: 256 * 1024 * 1024, // 256MB for particles
-                        max_compute_workgroup_size_x: 256,
-                        ..Default::default()
+                        max_texture_dimension_2d: adapter.limits().max_texture_dimension_2d.min(8192),
+                        max_storage_buffer_binding_size: adapter.limits().max_storage_buffer_binding_size.min(256 * 1024 * 1024), // 256MB for particles
+                        max_compute_workgroup_size_x: adapter.limits().max_compute_workgroup_size_x.min(256),
+                        ..wgpu::Limits::downlevel_defaults()
                     },
-                    memory_hints: wgpu::MemoryHints::Performance,
                 },
                 None,
             )
@@ -347,9 +346,7 @@ impl GpuRenderer {
             label: Some("Particle Compute Pipeline"),
             layout: Some(&compute_pipeline_layout),
             module: &compute_shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
+            entry_point: "main",
         });
 
         // Create render pipeline for particles
@@ -397,13 +394,12 @@ impl GpuRenderer {
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &render_shader,
-                entry_point: Some("vs_main"),
+                entry_point: "vs_main",
                 buffers: &[],
-                compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &render_shader,
-                entry_point: Some("fs_main"),
+                entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba16Float,
                     blend: Some(wgpu::BlendState {
@@ -416,7 +412,6 @@ impl GpuRenderer {
                     }),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
-                compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -425,7 +420,6 @@ impl GpuRenderer {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
-            cache: None,
         });
 
         // Create bloom downsample pipeline
@@ -476,18 +470,14 @@ impl GpuRenderer {
             label: Some("Bloom Downsample Pipeline"),
             layout: Some(&bloom_pipeline_layout),
             module: &bloom_shader,
-            entry_point: Some("downsample"),
-            compilation_options: Default::default(),
-            cache: None,
+            entry_point: "downsample",
         });
 
         let bloom_upsample_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Bloom Upsample Pipeline"),
             layout: Some(&bloom_pipeline_layout),
             module: &bloom_shader,
-            entry_point: Some("upsample"),
-            compilation_options: Default::default(),
-            cache: None,
+            entry_point: "upsample",
         });
 
         // Create tonemap pipeline
@@ -549,19 +539,17 @@ impl GpuRenderer {
             layout: Some(&tonemap_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &tonemap_shader,
-                entry_point: Some("vs_main"),
+                entry_point: "vs_main",
                 buffers: &[],
-                compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &tonemap_shader,
-                entry_point: Some("fs_main"),
+                entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba8UnormSrgb,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
-                compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -570,7 +558,6 @@ impl GpuRenderer {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
-            cache: None,
         });
 
         Ok(Self {
@@ -989,26 +976,22 @@ struct VertexOutput {
     @location(2) glow: f32,
 }
 
-@group(0) @binding(0) var<storage, read> particles: array<Particle>;
-@group(0) @binding(1) var<uniform> params: RenderParams;
-
-// Quad vertices for instanced rendering
-const QUAD_POSITIONS: array<vec2<f32>, 6> = array<vec2<f32>, 6>(
+var<private> QUAD_POSITIONS: array<vec2<f32>, 6> = array<vec2<f32>, 6>(
     vec2<f32>(-1.0, -1.0),
     vec2<f32>( 1.0, -1.0),
     vec2<f32>( 1.0,  1.0),
     vec2<f32>(-1.0, -1.0),
     vec2<f32>( 1.0,  1.0),
-    vec2<f32>(-1.0,  1.0),
+    vec2<f32>(-1.0,  1.0)
 );
 
-const QUAD_UVS: array<vec2<f32>, 6> = array<vec2<f32>, 6>(
+var<private> QUAD_UVS: array<vec2<f32>, 6> = array<vec2<f32>, 6>(
     vec2<f32>(0.0, 0.0),
     vec2<f32>(1.0, 0.0),
     vec2<f32>(1.0, 1.0),
     vec2<f32>(0.0, 0.0),
     vec2<f32>(1.0, 1.0),
-    vec2<f32>(0.0, 1.0),
+    vec2<f32>(0.0, 1.0)
 );
 
 @vertex

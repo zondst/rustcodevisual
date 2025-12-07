@@ -54,6 +54,7 @@ impl Default for AudioFrame {
 }
 
 /// Pre-analyzed audio data for frame-accurate sync
+#[derive(Clone)]
 pub struct AudioAnalysis {
     pub frames: Vec<AudioFrame>,
     pub sample_rate: u32,
