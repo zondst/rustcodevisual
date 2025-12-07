@@ -1,0 +1,36 @@
+[package]
+name = "particle_studio_rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.26.0"      # GUI framework
+egui = "0.26.0"        # Widgets
+serde = { version = "1.0", features = ["derive"] } # Config serialization
+serde_json = "1.0"
+rand = "0.8"           # Random generation
+rodio = "0.17"         # Audio playback
+glam = "0.25"          # Vector math (Vec2)
+rfd = "0.14"           # File dialogs (Open file)
+anyhow = "1.0"         # Error handling
+crossbeam-channel = "0.5" # Thread communication
+
+# Audio decoding & analysis
+symphonia = { version = "0.5", features = ["mp3", "flac", "ogg", "wav", "aac"] }
+rustfft = "6.1"
+
+# Image processing
+image = "0.24"
+imageproc = "0.23"
+
+# Parallel processing
+rayon = "1.8"
+
+# Utility
+bytemuck = { version = "1.14", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
