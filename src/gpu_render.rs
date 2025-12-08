@@ -74,10 +74,15 @@ pub struct GpuRenderer {
     hdr_texture: wgpu::Texture,
     hdr_view: wgpu::TextureView,
 
+    // MSAA textures for anti-aliased particle rendering
+    msaa_texture: wgpu::Texture,
+    msaa_view: wgpu::TextureView,
+    sample_count: u32,
+
     // Bloom textures (mip chain)
     bloom_textures: Vec<wgpu::Texture>,
     bloom_views: Vec<wgpu::TextureView>,
-    
+
     // Overlay texture (Waveform/Spectrum)
     overlay_texture: wgpu::Texture,
     overlay_view: wgpu::TextureView,
@@ -185,12 +190,12 @@ impl GpuRenderer {
         });
         let render_view = render_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Create HDR texture for particle rendering
+        // Create HDR texture for particle rendering (resolve target for MSAA)
         let hdr_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("HDR Buffer"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count: 1,  // Resolve target must be sample_count: 1
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba16Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
@@ -199,6 +204,31 @@ impl GpuRenderer {
             view_formats: &[],
         });
         let hdr_view = hdr_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Detect supported MSAA sample count (prefer 4x for quality/performance balance)
+        let sample_flags = adapter.get_texture_format_features(wgpu::TextureFormat::Rgba16Float).flags;
+        let sample_count = if sample_flags.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X4) {
+            4
+        } else if sample_flags.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X2) {
+            2
+        } else {
+            1
+        };
+
+        log::info!("MSAA sample count: {}x", sample_count);
+
+        // Create MSAA texture for anti-aliased particle rendering
+        let msaa_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("MSAA HDR Texture"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count,  // 4x MSAA for smooth particle edges
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,  // Only used for rendering
+            view_formats: &[],
+        });
+        let msaa_view = msaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Create bloom mip chain (5 levels)
         let mut bloom_textures = Vec::new();
@@ -448,7 +478,12 @@ impl GpuRenderer {
                 ..Default::default()
             },
             depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
+            // MSAA multisample state - must match the MSAA texture sample count
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
             multiview: None,
         });
 
@@ -607,6 +642,9 @@ impl GpuRenderer {
             render_view,
             hdr_texture,
             hdr_view,
+            msaa_texture,
+            msaa_view,
+            sample_count,
             overlay_texture,
             overlay_view,
             bloom_textures,
@@ -723,7 +761,7 @@ impl GpuRenderer {
         self.current_buffer = dst_buffer;
     }
 
-    /// Render particles to HDR texture
+    /// Render particles to HDR texture with MSAA anti-aliasing
     pub fn render_particles(&self, num_particles: u32, params: &RenderParams, bg_color: [f32; 4]) {
         self.queue.write_buffer(&self.render_params_buffer, 0, bytemuck::bytes_of(params));
 
@@ -747,11 +785,20 @@ impl GpuRenderer {
         });
 
         {
+            // Use MSAA texture for rendering with resolve to HDR texture
+            // If MSAA is enabled (sample_count > 1), render to MSAA texture and resolve to HDR
+            // If MSAA is disabled (sample_count == 1), render directly to HDR texture
+            let (view, resolve_target) = if self.sample_count > 1 {
+                (&self.msaa_view, Some(&self.hdr_view))
+            } else {
+                (&self.hdr_view, None)
+            };
+
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Particle Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.hdr_view,
-                    resolve_target: None,
+                    view,
+                    resolve_target,  // MSAA resolve to HDR texture
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: bg_color[0] as f64,
@@ -1170,6 +1217,14 @@ fn vs_main(
     return output;
 }
 
+// Convert sRGB color to linear space for correct blending
+fn srgb_to_linear(srgb: vec3<f32>) -> vec3<f32> {
+    let cutoff = srgb <= vec3<f32>(0.04045);
+    let lower = srgb / 12.92;
+    let higher = pow((srgb + 0.055) / 1.055, vec3<f32>(2.4));
+    return select(higher, lower, cutoff);
+}
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Distance from center of quad (0.5, 0.5)
@@ -1193,42 +1248,56 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         dist = length(uv - center) * 2.0;
     }
 
-    // Volumetric rendering matching preview's draw_volumetric_particle
-    // Preview draws from outside in with multiple layers using Gaussian falloff
+    // =========================================================
+    // EXACT MATCH to preview's draw_volumetric_particle()
+    // Preview iterates steps from outside in:
+    //   - t goes from 0.0 (step 0) to 1.0 (step = steps-1)
+    //   - radius = size * (0.1 + t * 1.4), so outer = size*1.5, inner = size*0.1
+    //   - gaussian = exp(-3.0 * t * t)
+    //   - center_boost = if t < 0.3 { 1.0 + (0.3 - t) * 2.0 } else { 1.0 }
+    //   - alpha = base_alpha * gaussian * center_boost * 0.7
+    // =========================================================
+
+    // t represents position in the gradient (0 = center, 1 = outer edge)
+    // This is inverted from preview's iteration order
     let t = clamp(dist, 0.0, 1.0);
 
-    // Gaussian falloff similar to preview: exp(-3 * t^2)
-    // But normalized so center is brighter and edges fade smoothly
-    let gaussian = exp(-2.5 * t * t);
+    // Gaussian falloff exactly as preview: exp(-3.0 * t^2)
+    let gaussian = exp(-3.0 * t * t);
 
-    // Strong center brightness boost to match preview's hot white center
-    let center_boost = select(1.0, 1.0 + (0.35 - t) * 3.0, t < 0.35);
+    // Center brightness boost exactly as preview
+    // Note: preview uses (1.0 - t) for inner steps, so we use t directly
+    let inner_t = 1.0 - t;  // Convert to preview's t (0 at outer, 1 at center)
+    let center_boost = select(1.0, 1.0 + (inner_t - 0.7) * 2.0, inner_t > 0.7);
 
-    // Core intensity - bright solid center like preview
-    let core_intensity = smoothstep(0.6, 0.0, dist);
+    // Base intensity matching preview's 0.7 multiplier
+    let base_intensity = gaussian * center_boost * 0.7;
 
-    // Inner glow layer - replicates preview's inner circle layers
-    let inner_glow = exp(-2.0 * dist * dist);
+    // Glow extension - preview uses glow_intensity to scale outer fade
+    let glow_fade = exp(-1.5 * t * t) * input.glow * 0.5;
 
-    // Mid glow layer for smooth gradient
-    let mid_glow = exp(-1.5 * dist * dist) * 0.7;
+    // Combine for total intensity
+    let intensity = base_intensity + glow_fade;
 
-    // Outer glow layer - softer, extends further (preview's volumetric effect)
-    let outer_glow = exp(-0.8 * dist * dist) * input.glow;
+    // Convert input color to linear space for correct blending
+    // (input colors are in sRGB, GPU does linear blending)
+    let linear_color = srgb_to_linear(input.color.rgb);
 
-    // Combine all layers to match preview's multi-step rendering
-    // Preview iterates steps drawing circles at different radii
-    let intensity = core_intensity * 1.0 + inner_glow * 0.8 + mid_glow * 0.5 + outer_glow * 0.6 + gaussian * center_boost * 0.4;
+    // Brightness towards center matching preview: (1.0 + (1.0 - t) * 0.3)
+    let brightness_mult = 1.0 + inner_t * 0.3;
+    let brightened_color = linear_color * brightness_mult;
 
-    // Boost color brightness with glow intensity (matching preview's intensity parameter)
-    let glow_boost = 1.0 + input.glow * 1.2;
-    let boosted_color = input.color.rgb * glow_boost;
+    // Hot white center exactly as preview: +50/255 RGB when alpha > 0.04 (10/255)
+    let hot_center_strength = smoothstep(0.15, 0.0, dist);
+    let hot_center = select(
+        vec3<f32>(0.0),
+        vec3<f32>(50.0 / 255.0) * hot_center_strength,
+        input.color.a > 0.04
+    );
 
-    // Brightness towards center - preview adds +50 to center RGB
-    let brightness_mult = 1.0 + (1.0 - t) * 0.5;
-    let brightened_color = boosted_color * brightness_mult;
-
-    let final_color = brightened_color * intensity;
+    // Glow intensity boost matching preview
+    let glow_boost = 1.0 + input.glow * 0.8;
+    let final_color = (brightened_color + hot_center) * intensity * glow_boost;
     let final_alpha = input.color.a * intensity;
 
     // Skip nearly invisible fragments

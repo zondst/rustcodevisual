@@ -146,8 +146,11 @@ pub struct GpuExportConfig {
 fn start_ffmpeg(config: &GpuExportConfig) -> Result<Child, String> {
     let mut cmd = Command::new("ffmpeg");
 
-    // Input from pipe
+    // CRITICAL: Disable interactive mode and minimize stderr output
+    // This prevents the 99% hang issue caused by stderr buffer filling up
     cmd.arg("-y")
+       .arg("-nostdin")           // Disable interactive mode
+       .arg("-loglevel").arg("error")  // Only show errors, reduce stderr output
        .arg("-vsync").arg("cfr")
        .arg("-f").arg("rawvideo")
        .arg("-pix_fmt").arg("rgba")
@@ -183,10 +186,10 @@ fn start_ffmpeg(config: &GpuExportConfig) -> Result<Child, String> {
     // Output file
     cmd.arg(&config.output_path);
 
-    // Pipe setup
+    // Pipe setup - redirect stderr to null to prevent buffer fill hang
     cmd.stdin(Stdio::piped())
        .stdout(Stdio::null())
-       .stderr(Stdio::piped());
+       .stderr(Stdio::null());  // FIXED: Redirect stderr to null instead of piped
 
     cmd.spawn().map_err(|e| format!("Failed to start FFmpeg: {}", e))
 }
@@ -244,9 +247,10 @@ fn run_gpu_export_impl(
     let mut gpu_particles = Vec::with_capacity(config.particles.count);
     let colors = config.get_color_scheme();
 
-    // Size boost factor to match preview's volumetric rendering appearance
-    // Preview uses draw_volumetric_particle with multiple layers creating larger visual effect
-    let size_boost = 2.5;
+    // Size factor matching preview - shader now handles volumetric rendering correctly
+    // Preview's draw_volumetric_particle uses radius from size*1.5 (outer) to size*0.1 (inner)
+    // Shader quad size is controlled by glow_mult in vertex shader (3.0 + glow_intensity * 1.5)
+    let size_factor = 1.0;  // No additional boost needed - shader handles this
 
     let cx = width as f32 / 2.0;
     let cy = height as f32 / 2.0;
@@ -271,10 +275,10 @@ fn run_gpu_export_impl(
             1.0,
         ];
 
-        // Calculate particle size with variation, matching preview
+        // Calculate particle size with variation, matching preview exactly
         let base_size = config.particles.min_size + rng.gen::<f32>() * (config.particles.max_size - config.particles.min_size);
         let size_var = 1.0 + (rng.gen::<f32>() - 0.5) * config.particles.size_variation;
-        let final_size = base_size * size_var * size_boost;
+        let final_size = base_size * size_var * size_factor;
 
         // CRITICAL: Match preview's particle lifecycle
         // Preview uses life: 2-5 seconds, audio_alpha: 0.1 (starts low, ramps up)
@@ -311,14 +315,73 @@ fn run_gpu_export_impl(
 
     renderer.upload_particles(&gpu_particles);
 
-    // 3. Start FFmpeg
-    let mut ffmpeg = start_ffmpeg(&export_config)?;
-    let ffmpeg_stdin = ffmpeg.stdin.as_mut().ok_or("Failed to open FFmpeg stdin")?;
+    // 3. Start FFmpeg with triple-buffered async pipeline
+    let ffmpeg = start_ffmpeg(&export_config)?;
+
+    // Create bounded channel for triple-buffering (3 frames in flight)
+    let (frame_tx, frame_rx): (Sender<FrameData>, Receiver<FrameData>) = bounded(3);
+
+    // Spawn FFmpeg writer thread
+    let output_path = export_config.output_path.clone();
+    let progress_tx_clone = progress_tx.clone();
+    let ffmpeg_handle = thread::spawn(move || -> Result<(), String> {
+        let mut ffmpeg = ffmpeg;
+        let stdin = ffmpeg.stdin.as_mut().ok_or("Failed to open FFmpeg stdin")?;
+
+        let mut last_progress_frame = 0;
+        let progress_interval = 15;
+
+        for frame in frame_rx {
+            // Write frame to FFmpeg
+            stdin.write_all(&frame.pixels)
+                .map_err(|e| format!("FFmpeg write error: {}", e))?;
+
+            // Send progress updates (from writer thread for accurate encoding progress)
+            if frame.frame_index - last_progress_frame >= progress_interval {
+                let _ = progress_tx_clone.send(GpuExportMessage::Progress {
+                    current: frame.frame_index,
+                    total: total_frames,
+                    fps: 0.0, // Will be calculated from elapsed time
+                });
+                last_progress_frame = frame.frame_index;
+            }
+        }
+
+        // Close stdin to signal EOF
+        drop(stdin);
+
+        // Wait for FFmpeg to finish with timeout
+        let wait_start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(60);
+
+        loop {
+            match ffmpeg.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        return Err(format!("FFmpeg exited with code: {:?}", status.code()));
+                    }
+                    break;
+                }
+                Ok(None) => {
+                    if wait_start.elapsed() > timeout {
+                        let _ = ffmpeg.kill();
+                        return Err("FFmpeg encoding timeout".to_string());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => {
+                    return Err(format!("Failed to wait for FFmpeg: {}", e));
+                }
+            }
+        }
+
+        Ok(())
+    });
 
     // 4. Audio State
     let mut audio_state = AudioState::new();
 
-    // 5. Render Loop
+    // 5. Render Loop (async - doesn't wait for FFmpeg writes)
     let dt = 1.0 / fps as f32;
     let mut time = 0.0;
     let start_time = std::time::Instant::now();
@@ -381,11 +444,11 @@ fn run_gpu_export_impl(
             _padding: [0.0; 2],
         };
 
-        // Render Params - matched to preview quality with boosted glow
+        // Render Params - matched to preview quality exactly
         let render_params = RenderParams {
             width: width as f32,
             height: height as f32,
-            glow_intensity: config.particles.glow_intensity * 1.5, // Boost glow to match preview volumetric rendering
+            glow_intensity: config.particles.glow_intensity, // Use exact config value - shader handles volumetric rendering
             exposure: 1.0,
             bloom_strength: config.visual.bloom_intensity,
             shape_id: match config.particles.shape {
@@ -418,38 +481,56 @@ fn run_gpu_export_impl(
             srgb_to_linear(colors.background[2]),
             1.0
         ];
-        
+
         renderer.render_particles(config.particles.count as u32, &render_params, bg);
-        
+
         // Render and upload overlay
         let overlay_pixels = render_overlay_cpu(width, height, &audio_state, &config);
         renderer.upload_overlay(&overlay_pixels);
 
         renderer.tonemap(&render_params);
-        
-        // Readback and Write
+
+        // Readback frame from GPU
         let pixels = renderer.read_frame();
-        ffmpeg_stdin.write_all(&pixels).map_err(|e| format!("FFmpeg write error: {}", e))?;
+
+        // Send to FFmpeg writer thread (non-blocking with triple-buffer)
+        // This allows GPU to continue rendering while FFmpeg writes
+        if frame_tx.send(FrameData { frame_index: frame_idx, pixels }).is_err() {
+            return Err("FFmpeg writer thread closed unexpectedly".to_string());
+        }
 
         time += dt;
 
-        // Progress
-        if frame_idx % 15 == 0 {
+        // Update progress with render FPS (separate from encoding progress)
+        if frame_idx % 30 == 0 {
             let elapsed = start_time.elapsed().as_secs_f32();
-            let current_fps = frame_idx as f32 / elapsed.max(0.1);
-            let _ = progress_tx.send(GpuExportMessage::Progress { 
-                current: frame_idx, 
-                total: total_frames, 
-                fps: current_fps 
+            let render_fps = frame_idx as f32 / elapsed.max(0.001);
+            let _ = progress_tx.send(GpuExportMessage::Progress {
+                current: frame_idx,
+                total: total_frames,
+                fps: render_fps,
             });
         }
     }
 
-    // Finish
-    drop(ffmpeg_stdin); // Signal EOF
-    let _ = ffmpeg.wait();
-    
-    let _ = progress_tx.send(GpuExportMessage::Completed { path: export_config.output_path });
+    // Close frame channel to signal completion
+    drop(frame_tx);
+
+    // Wait for FFmpeg writer thread to finish
+    let ffmpeg_result = ffmpeg_handle.join()
+        .map_err(|_| "FFmpeg writer thread panicked".to_string())?;
+
+    // Check for FFmpeg errors
+    ffmpeg_result?;
+
+    // Send 100% progress after successful completion
+    let _ = progress_tx.send(GpuExportMessage::Progress {
+        current: total_frames,
+        total: total_frames,
+        fps: 0.0,
+    });
+
+    let _ = progress_tx.send(GpuExportMessage::Completed { path: output_path });
     Ok(())
 }
 
@@ -489,38 +570,46 @@ pub fn get_gpu_info() -> Option<String> {
     })
 }
 
-/// Draw an anti-aliased line with glow effect (enhanced to match preview quality)
-fn draw_line_with_glow(
-    image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
-    start: (f32, f32),
-    end: (f32, f32),
-    color: [u8; 3],
-    thickness: f32,
-    glow_alpha: u8,
-) {
-    // Draw outer glow first (wider, more transparent) - enhanced for preview match
-    let outer_glow_color = Rgba([color[0], color[1], color[2], glow_alpha / 4]);
-    draw_antialiased_line_with_thickness(image, start, end, outer_glow_color, thickness * 5.0);
-
-    // Draw mid-outer glow
-    let mid_outer_glow = Rgba([color[0], color[1], color[2], glow_alpha / 3]);
-    draw_antialiased_line_with_thickness(image, start, end, mid_outer_glow, thickness * 3.5);
-
-    // Draw mid glow (brighter)
-    let mid_glow_color = Rgba([color[0], color[1], color[2], (glow_alpha as u16 * 2 / 3).min(255) as u8]);
-    draw_antialiased_line_with_thickness(image, start, end, mid_glow_color, thickness * 2.5);
-
-    // Draw inner glow
-    let inner_glow = Rgba([color[0], color[1], color[2], glow_alpha]);
-    draw_antialiased_line_with_thickness(image, start, end, inner_glow, thickness * 1.5);
-
-    // Draw main line (full brightness)
-    let main_color = Rgba([color[0], color[1], color[2], 255]);
-    draw_antialiased_line_with_thickness(image, start, end, main_color, thickness);
+/// Signed Distance Function for a line segment
+/// Returns the distance from point p to the closest point on line segment a-b
+fn sdf_line_segment(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let pa = (p.0 - a.0, p.1 - a.1);
+    let ba = (b.0 - a.0, b.1 - a.1);
+    let ba_len_sq = ba.0 * ba.0 + ba.1 * ba.1;
+    if ba_len_sq < 0.0001 {
+        return (pa.0 * pa.0 + pa.1 * pa.1).sqrt();
+    }
+    let h = ((pa.0 * ba.0 + pa.1 * ba.1) / ba_len_sq).clamp(0.0, 1.0);
+    let d = (pa.0 - ba.0 * h, pa.1 - ba.1 * h);
+    (d.0 * d.0 + d.1 * d.1).sqrt()
 }
 
-/// Draw an anti-aliased line with specified thickness (Bresenham with alpha blending)
-fn draw_antialiased_line_with_thickness(
+/// Proper premultiplied alpha blending
+fn blend_pixel_premultiplied(image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>, x: u32, y: u32, src: Rgba<u8>) {
+    let dst = *image.get_pixel(x, y);
+
+    let src_a = src.0[3] as f32 / 255.0;
+    let dst_a = dst.0[3] as f32 / 255.0;
+
+    // Premultiplied alpha compositing: out = src + dst * (1 - src_a)
+    let out_a = src_a + dst_a * (1.0 - src_a);
+
+    if out_a > 0.001 {
+        let out_r = (src.0[0] as f32 * src_a + dst.0[0] as f32 * dst_a * (1.0 - src_a)) / out_a;
+        let out_g = (src.0[1] as f32 * src_a + dst.0[1] as f32 * dst_a * (1.0 - src_a)) / out_a;
+        let out_b = (src.0[2] as f32 * src_a + dst.0[2] as f32 * dst_a * (1.0 - src_a)) / out_a;
+
+        image.put_pixel(x, y, Rgba([
+            out_r.clamp(0.0, 255.0) as u8,
+            out_g.clamp(0.0, 255.0) as u8,
+            out_b.clamp(0.0, 255.0) as u8,
+            (out_a * 255.0).clamp(0.0, 255.0) as u8,
+        ]));
+    }
+}
+
+/// Draw an anti-aliased line with proper SDF-based rendering
+fn draw_antialiased_line_correct(
     image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
     start: (f32, f32),
     end: (f32, f32),
@@ -532,63 +621,87 @@ fn draw_antialiased_line_with_thickness(
     let width = image.width() as i32;
     let height = image.height() as i32;
 
-    let dx = x1 - x0;
-    let dy = y1 - y0;
-    let length = (dx * dx + dy * dy).sqrt();
+    let half_thick = thickness * 0.5;
+    let aa_width = 1.5; // Anti-aliasing width in pixels
 
-    if length < 0.5 {
-        return;
-    }
+    // Bounding box with padding for anti-aliasing
+    let min_x = (x0.min(x1) - half_thick - aa_width).floor() as i32;
+    let max_x = (x0.max(x1) + half_thick + aa_width).ceil() as i32;
+    let min_y = (y0.min(y1) - half_thick - aa_width).floor() as i32;
+    let max_y = (y0.max(y1) + half_thick + aa_width).ceil() as i32;
 
-    // Perpendicular direction for thickness
-    let nx = -dy / length;
-    let ny = dx / length;
+    for py in min_y.max(0)..=max_y.min(height - 1) {
+        for px in min_x.max(0)..=max_x.min(width - 1) {
+            let p = (px as f32 + 0.5, py as f32 + 0.5);
 
-    // Number of steps along the line
-    let steps = (length * 2.0) as i32;
-    let half_thick = thickness / 2.0;
+            // Signed distance to line segment
+            let dist = sdf_line_segment(p, start, end);
 
-    for step in 0..=steps {
-        let t = step as f32 / steps as f32;
-        let cx = x0 + dx * t;
-        let cy = y0 + dy * t;
+            // Distance from edge of line
+            let edge_dist = dist - half_thick;
 
-        // Draw pixels perpendicular to line
-        let thick_steps = (thickness * 2.0) as i32;
-        for ts in -thick_steps..=thick_steps {
-            let offset = ts as f32 / 2.0;
-            let px = (cx + nx * offset) as i32;
-            let py = (cy + ny * offset) as i32;
+            // Smooth anti-aliased transition using smoothstep
+            let alpha = if edge_dist < -aa_width {
+                1.0
+            } else if edge_dist > aa_width {
+                0.0
+            } else {
+                let t = (edge_dist + aa_width) / (2.0 * aa_width);
+                1.0 - t * t * (3.0 - 2.0 * t) // smoothstep
+            };
 
-            if px >= 0 && px < width && py >= 0 && py < height {
-                let dist_from_center = offset.abs();
-                let alpha_mult = if dist_from_center < half_thick {
-                    1.0
-                } else {
-                    (1.0 - (dist_from_center - half_thick) / half_thick).max(0.0)
-                };
-
-                let pixel = image.get_pixel_mut(px as u32, py as u32);
-                let src_alpha = (color[3] as f32 * alpha_mult) as u8;
-
-                // Alpha blending
-                let dst_alpha = pixel[3];
-                let out_alpha = src_alpha as u16 + dst_alpha as u16 * (255 - src_alpha) as u16 / 255;
-
-                if out_alpha > 0 {
-                    let blend = |s: u8, d: u8| -> u8 {
-                        let result = (s as u16 * src_alpha as u16 + d as u16 * dst_alpha as u16 * (255 - src_alpha) as u16 / 255) / out_alpha;
-                        result.min(255) as u8
-                    };
-
-                    pixel[0] = blend(color[0], pixel[0]);
-                    pixel[1] = blend(color[1], pixel[1]);
-                    pixel[2] = blend(color[2], pixel[2]);
-                    pixel[3] = out_alpha.min(255) as u8;
-                }
+            if alpha > 0.001 {
+                let final_alpha = (color.0[3] as f32 * alpha).clamp(0.0, 255.0) as u8;
+                blend_pixel_premultiplied(
+                    image,
+                    px as u32,
+                    py as u32,
+                    Rgba([color.0[0], color.0[1], color.0[2], final_alpha]),
+                );
             }
         }
     }
+}
+
+/// Draw a line with simplified glow effect (2 layers instead of 5 to reduce artifacts)
+fn draw_line_with_glow(
+    image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
+    start: (f32, f32),
+    end: (f32, f32),
+    color: [u8; 3],
+    thickness: f32,
+    glow_alpha: u8,
+) {
+    // 1. Outer glow layer (single, wider)
+    let glow_thickness = thickness * 3.0;
+    let outer_alpha = (glow_alpha as f32 * 0.3).clamp(0.0, 255.0) as u8;
+    draw_antialiased_line_correct(
+        image,
+        start,
+        end,
+        Rgba([color[0], color[1], color[2], outer_alpha]),
+        glow_thickness,
+    );
+
+    // 2. Main line (full opacity)
+    draw_antialiased_line_correct(
+        image,
+        start,
+        end,
+        Rgba([color[0], color[1], color[2], 255]),
+        thickness,
+    );
+}
+
+/// Legacy function kept for compatibility - redirects to new implementation
+fn draw_antialiased_line_with_thickness(
+    image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
+    start: (f32, f32),
+    end: (f32, f32),
+    color: Rgba<u8>,
+    thickness: f32,
+) {
+    draw_antialiased_line_correct(image, start, end, color, thickness);
 }
 
 /// Draw a circle outline with optional glow
