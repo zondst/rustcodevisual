@@ -238,59 +238,55 @@ fn run_gpu_export_impl(
     let mut renderer = GpuRenderer::new(width, height, config.particles.count as u32)
         .map_err(|e| format!("Failed to init GPU renderer: {}", e))?;
 
-    // 2. Generate Initial Particles
-    let mut particle_engine = ParticleEngine::new(width as f32, height as f32);
-    // We can assume a default spawn or use the logic from ParticleEngine
-    // Since spawn_initial might not be public or do exactly what we want for GPU, 
-    // we'll just use the engine's initialization which spawns some checks or randoms.
-    // Actually, let's just create random particles if we can't easily use engine spawn.
-    // Checking `particles.rs`... `ParticleEngine::new` likely creates empty.
-    // Let's manually spawn or use a public method if available. 
-    // Assuming `resize` or just manual init. 
-    // Simplest is to manually create GpuParticles here to avoid dependency issues or complex setup.
-    // OR, use the existing engine logic which we have `use crate::particles::ParticleEngine;` for.
-    // `ParticleEngine` usually has `init_particles` or similar.
-    // Let's try `ParticleEngine::new` then inspect. 
-    // Actually `ParticleEngine` manages `Particle` structs.
-    // We need to convert them.
-    // Let's create `GpuParticle`s directly to be safe and simple.
-    
+    // 2. Generate Initial Particles - matching preview quality
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let mut gpu_particles = Vec::with_capacity(config.particles.count);
-    let colors = config.get_color_scheme(); // Get color scheme for particle colors
-    
-    // Improved initialization logic
-    for i in 0..config.particles.count {
+    let colors = config.get_color_scheme();
+
+    // Size boost factor to match preview's volumetric rendering appearance
+    // Preview uses draw_volumetric_particle with multiple layers creating larger visual effect
+    let size_boost = 2.5;
+
+    for _i in 0..config.particles.count {
         let (pos, vel) = match config.particles.mode {
             crate::config::ParticleMode::Orbit => {
-                // Initialize in a circle for orbit mode
-                 let angle = rng.gen_range(0.0..std::f32::consts::TAU);
-                 let radius = rng.gen_range(50.0..300.0);
-                 let cx = width as f32 / 2.0;
-                 let cy = height as f32 / 2.0;
-                 (
-                     [cx + angle.cos() * radius, cy + angle.sin() * radius],
-                     [angle.sin() * 2.0, -angle.cos() * 2.0] // Tangential velocity
-                 )
+                let angle = rng.gen_range(0.0..std::f32::consts::TAU);
+                let radius = rng.gen_range(50.0..300.0);
+                let cx = width as f32 / 2.0;
+                let cy = height as f32 / 2.0;
+                (
+                    [cx + angle.cos() * radius, cy + angle.sin() * radius],
+                    [angle.sin() * 2.0, -angle.cos() * 2.0]
+                )
             },
             crate::config::ParticleMode::Cinematic => {
-                // Initialize in a wider smoother distribution
-                 let angle = rng.gen_range(0.0..std::f32::consts::TAU);
-                 let radius = rng.gen_range(100.0..500.0);
-                 let cx = width as f32 / 2.0;
-                 let cy = height as f32 / 2.0;
-                 (
-                     [cx + angle.cos() * radius, cy + angle.sin() * radius],
-                     [rng.gen_range(-0.5..0.5), rng.gen_range(-0.5..0.5)]
-                 )
+                let angle = rng.gen_range(0.0..std::f32::consts::TAU);
+                let radius = rng.gen_range(100.0..500.0);
+                let cx = width as f32 / 2.0;
+                let cy = height as f32 / 2.0;
+                (
+                    [cx + angle.cos() * radius, cy + angle.sin() * radius],
+                    [rng.gen_range(-0.5..0.5), rng.gen_range(-0.5..0.5)]
+                )
             },
             _ => {
-                // Random scatter for Chaos/others
-                (
-                    [rng.gen_range(0.0..width as f32), rng.gen_range(0.0..height as f32)],
-                    [rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0)]
-                )
+                // For Chaos and other modes, spawn from center if configured
+                if config.particles.spawn_from_center {
+                    let angle = rng.gen_range(0.0..std::f32::consts::TAU);
+                    let radius = rng.gen_range(10.0..config.particles.spawn_radius);
+                    let cx = width as f32 / 2.0;
+                    let cy = height as f32 / 2.0;
+                    (
+                        [cx + angle.cos() * radius, cy + angle.sin() * radius],
+                        [angle.cos() * rng.gen_range(0.2..0.8), angle.sin() * rng.gen_range(0.2..0.8)]
+                    )
+                } else {
+                    (
+                        [rng.gen_range(0.0..width as f32), rng.gen_range(0.0..height as f32)],
+                        [rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0)]
+                    )
+                }
             }
         };
 
@@ -304,21 +300,25 @@ fn run_gpu_export_impl(
             1.0,
         ];
 
+        // Calculate particle size with variation, matching preview
+        let base_size = config.particles.min_size + rng.gen::<f32>() * (config.particles.max_size - config.particles.min_size);
+        let size_var = 1.0 + (rng.gen::<f32>() - 0.5) * config.particles.size_variation;
+        let final_size = base_size * size_var * size_boost;
+
         gpu_particles.push(GpuParticle {
             position: pos,
             velocity: vel,
             color: color_val,
-            size: rng.gen_range(config.particles.min_size..config.particles.max_size),
-            // Default life to high value since we re-spawn in compute shader or don't manage life on CPU for export
-            life: 100.0, 
-            max_life: 100.0,
+            size: final_size,
+            life: 50.0 + rng.gen::<f32>() * 100.0,
+            max_life: 150.0,
             audio_alpha: 1.0,
             audio_size: 1.0,
             brightness: 1.0,
             _padding: [0.0; 2],
         });
     }
-    
+
     renderer.upload_particles(&gpu_particles);
 
     // 3. Start FFmpeg
@@ -341,7 +341,7 @@ fn run_gpu_export_impl(
             audio_state.update_from_frame(&frame, config.audio.smoothing);
         }
 
-        // Sim Params
+        // Sim Params - use actual config values for proper physics matching preview
         let sim_params = SimParams {
             delta_time: dt,
             time,
@@ -352,27 +352,26 @@ fn run_gpu_export_impl(
             audio_mid: audio_state.mid,
             audio_high: audio_state.high,
             audio_beat: audio_state.beat,
-            beat_burst_strength: 0.5,
-            damping: config.particles.damping, 
-
+            beat_burst_strength: config.particles.beat_burst_strength,
+            damping: config.particles.damping,
             speed: config.particles.speed,
             num_particles: config.particles.count as u32,
             has_audio: 1,
             _padding: [0.0; 2],
         };
-        
-        // Render Params - matched to preview quality
+
+        // Render Params - matched to preview quality with boosted glow
         let render_params = RenderParams {
             width: width as f32,
             height: height as f32,
-            glow_intensity: config.particles.glow_intensity,
-            exposure: 1.0, // Full exposure to match preview
-            bloom_strength: config.visual.bloom_intensity, // Full bloom to match preview
+            glow_intensity: config.particles.glow_intensity * 1.5, // Boost glow to match preview volumetric rendering
+            exposure: 1.0,
+            bloom_strength: config.visual.bloom_intensity,
             shape_id: match config.particles.shape {
-                 crate::config::ParticleShape::Circle => 0.0,
-                 crate::config::ParticleShape::Diamond => 1.0,
-                 crate::config::ParticleShape::Star => 2.0,
-                 _ => 0.0,
+                crate::config::ParticleShape::Circle => 0.0,
+                crate::config::ParticleShape::Diamond => 1.0,
+                crate::config::ParticleShape::Star => 2.0,
+                _ => 0.0,
             },
             _padding: [0.0; 2],
         };
@@ -380,13 +379,22 @@ fn run_gpu_export_impl(
         // GPU Execution
         renderer.upload_spectrum(&audio_state.spectrum);
         renderer.simulate_particles(&sim_params);
-        
-        // Get bg color
+
+        // Get background color - convert sRGB to linear for correct rendering
+        // The output texture (Rgba8UnormSrgb) will convert linear back to sRGB
         let colors = config.get_color_scheme();
+        let srgb_to_linear = |srgb: u8| -> f32 {
+            let s = srgb as f32 / 255.0;
+            if s <= 0.04045 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
         let bg = [
-            colors.background[0] as f32 / 255.0, 
-            colors.background[1] as f32 / 255.0, 
-            colors.background[2] as f32 / 255.0, 
+            srgb_to_linear(colors.background[0]),
+            srgb_to_linear(colors.background[1]),
+            srgb_to_linear(colors.background[2]),
             1.0
         ];
         

@@ -1070,8 +1070,8 @@ fn vs_main(
 
     var output: VertexOutput;
 
-    // Skip invisible particles
-    if (p.audio_alpha < 0.01 || p.life <= 0.0) {
+    // Skip invisible particles - less aggressive culling to match preview
+    if (p.audio_alpha < 0.005 || p.life <= 0.0) {
         output.position = vec4<f32>(0.0, 0.0, -2.0, 1.0);
         output.color = vec4<f32>(0.0);
         output.uv = vec2<f32>(0.0);
@@ -1083,8 +1083,9 @@ fn vs_main(
     let quad_pos = QUAD_POSITIONS[local_vertex_idx];
     let quad_uv = QUAD_UVS[local_vertex_idx];
 
-    // Scale by particle size with glow extension (increased for better visibility)
-    let glow_mult = 2.0 + params.glow_intensity * 0.8;
+    // Scale by particle size with glow extension - increased to match preview volumetric rendering
+    // Preview's draw_volumetric_particle uses radius up to size * 1.5, so we need larger quads
+    let glow_mult = 3.0 + params.glow_intensity * 1.5;
     let size = p.size * p.audio_size * glow_mult;
 
     // Convert to clip space
@@ -1094,12 +1095,11 @@ fn vs_main(
 
     output.position = vec4<f32>(clip_x, clip_y, 0.0, 1.0);
 
-    // Compute alpha from life and audio
+    // Compute alpha from life and audio - boost alpha for better visibility
     let life_alpha = clamp(p.life / p.max_life, 0.0, 1.0);
-    let alpha = life_alpha * p.audio_alpha * p.brightness;
+    let alpha = clamp(life_alpha * p.audio_alpha * p.brightness * 1.2, 0.0, 1.0);
 
-    // Use colors directly without sRGB conversion (matches preview rendering)
-    // The output texture is Rgba8UnormSrgb which handles gamma automatically
+    // Use colors directly - matches preview rendering
     output.color = vec4<f32>(p.color.rgb, alpha);
     output.uv = quad_uv;
     output.glow = params.glow_intensity;
@@ -1130,45 +1130,50 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         dist = length(uv - center) * 2.0;
     }
 
-    // Volumetric rendering matching preview quality
-    // Uses Gaussian falloff similar to draw_volumetric_particle
+    // Volumetric rendering matching preview's draw_volumetric_particle
+    // Preview draws from outside in with multiple layers using Gaussian falloff
     let t = clamp(dist, 0.0, 1.0);
 
-    // Gaussian falloff for smooth gradient: exp(-3 * t^2)
-    let gaussian = exp(-3.0 * t * t);
+    // Gaussian falloff similar to preview: exp(-3 * t^2)
+    // But normalized so center is brighter and edges fade smoothly
+    let gaussian = exp(-2.5 * t * t);
 
-    // Additional brightness boost at center (matching preview)
-    let center_boost = select(1.0, 1.0 + (0.3 - t) * 2.0, t < 0.3);
+    // Strong center brightness boost to match preview's hot white center
+    let center_boost = select(1.0, 1.0 + (0.35 - t) * 3.0, t < 0.35);
 
-    // Core intensity with sharp center
-    let core_intensity = smoothstep(0.8, 0.0, dist);
+    // Core intensity - bright solid center like preview
+    let core_intensity = smoothstep(0.6, 0.0, dist);
 
-    // Inner glow layer (brighter)
-    let inner_glow = exp(-2.5 * dist * dist);
+    // Inner glow layer - replicates preview's inner circle layers
+    let inner_glow = exp(-2.0 * dist * dist);
 
-    // Outer glow layer (softer, controlled by glow_intensity)
-    let outer_glow = exp(-1.2 * dist * dist) * input.glow * 0.8;
+    // Mid glow layer for smooth gradient
+    let mid_glow = exp(-1.5 * dist * dist) * 0.7;
 
-    // Combine layers with weights matching preview rendering
-    let intensity = core_intensity * 0.8 + inner_glow * 0.6 + outer_glow * 0.4 + gaussian * center_boost * 0.3;
+    // Outer glow layer - softer, extends further (preview's volumetric effect)
+    let outer_glow = exp(-0.8 * dist * dist) * input.glow;
 
-    // Boost color brightness with glow intensity
-    let glow_boost = 1.0 + input.glow * 0.8;
+    // Combine all layers to match preview's multi-step rendering
+    // Preview iterates steps drawing circles at different radii
+    let intensity = core_intensity * 1.0 + inner_glow * 0.8 + mid_glow * 0.5 + outer_glow * 0.6 + gaussian * center_boost * 0.4;
+
+    // Boost color brightness with glow intensity (matching preview's intensity parameter)
+    let glow_boost = 1.0 + input.glow * 1.2;
     let boosted_color = input.color.rgb * glow_boost;
 
-    // Slight brightening towards center (matching preview)
-    let brightness_mult = 1.0 + (1.0 - t) * 0.4;
+    // Brightness towards center - preview adds +50 to center RGB
+    let brightness_mult = 1.0 + (1.0 - t) * 0.5;
     let brightened_color = boosted_color * brightness_mult;
 
     let final_color = brightened_color * intensity;
     let final_alpha = input.color.a * intensity;
 
     // Skip nearly invisible fragments
-    if (final_alpha < 0.002) {
+    if (final_alpha < 0.001) {
         discard;
     }
 
-    // Output premultiplied alpha (color already multiplied by alpha)
+    // Output premultiplied alpha for correct blending
     return vec4<f32>(final_color * final_alpha, final_alpha);
 }
 "#;
