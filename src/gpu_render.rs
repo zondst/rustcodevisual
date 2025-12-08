@@ -822,6 +822,126 @@ impl GpuRenderer {
         self.queue.submit(std::iter::once(encoder.finish()));
     }
 
+    /// Execute bloom pass (downsample -> upsample)
+    pub fn run_bloom(&self) {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Bloom Encoder"),
+        });
+
+        // Downsample: HDR -> bloom mip 0
+        {
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Bloom Downsample 0"),
+                layout: &self.bloom_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&self.hdr_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.bloom_views[0]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Bloom Downsample Pass 0"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&self.bloom_downsample_pipeline);
+            compute_pass.set_bind_group(0, &bind_group, &[]);
+
+            let mip_width = (self.width / 2).max(1);
+            let mip_height = (self.height / 2).max(1);
+            compute_pass.dispatch_workgroups((mip_width + 7) / 8, (mip_height + 7) / 8, 1);
+        }
+
+        // Continue downsampling through mip chain
+        let mut mip_width = self.width / 2;
+        let mut mip_height = self.height / 2;
+
+        for i in 0..4 {
+            mip_width = (mip_width / 2).max(1);
+            mip_height = (mip_height / 2).max(1);
+
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("Bloom Downsample {}", i + 1)),
+                layout: &self.bloom_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&self.bloom_views[i]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.bloom_views[i + 1]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(&format!("Bloom Downsample Pass {}", i + 1)),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&self.bloom_downsample_pipeline);
+            compute_pass.set_bind_group(0, &bind_group, &[]);
+            compute_pass.dispatch_workgroups((mip_width + 7) / 8, (mip_height + 7) / 8, 1);
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Upsample: mip 4 -> mip 0
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Bloom Upsample Encoder"),
+        });
+
+        mip_width = self.width / 32;
+        mip_height = self.height / 32;
+
+        for i in (0..4).rev() {
+            mip_width = (mip_width * 2).min(self.width / 2);
+            mip_height = (mip_height * 2).min(self.height / 2);
+
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("Bloom Upsample {}", i)),
+                layout: &self.bloom_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&self.bloom_views[i + 1]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.bloom_views[i]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(&format!("Bloom Upsample Pass {}", i)),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&self.bloom_upsample_pipeline);
+            compute_pass.set_bind_group(0, &bind_group, &[]);
+            compute_pass.dispatch_workgroups((mip_width + 7) / 8, (mip_height + 7) / 8, 1);
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
     /// Apply tonemap and output to final texture
     pub fn tonemap(&self, params: &RenderParams) {
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1084,25 +1204,26 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         p.velocity = p.velocity * (5.0 / vel_mag);
     }
 
-    // Audio-driven opacity with asymmetric attack/release (matching preview exactly)
+    // Audio-driven opacity with asymmetric attack/release (BOOSTED for better visibility)
     if (audio_reactive) {
-        // Target alpha based on audio level
-        let target_alpha = select(0.0, clamp(audio_level, 0.4, 1.0), has_audio);
+        // Target alpha based on audio level - HIGHER minimum for visibility
+        let target_alpha = select(0.3, clamp(audio_level * 1.5, 0.6, 1.0), has_audio);
 
-        // Asymmetric fade: fast appear (attack), slow fade (release)
-        let fade_speed = select(params.fade_release_speed, params.fade_attack_speed, target_alpha > p.audio_alpha);
+        // Asymmetric fade: FASTER appear (attack), slower fade (release)
+        let fade_speed = select(params.fade_release_speed * 0.5, params.fade_attack_speed * 2.0, target_alpha > p.audio_alpha);
         p.audio_alpha += (target_alpha - p.audio_alpha) * fade_speed * dt;
-        p.audio_alpha = clamp(p.audio_alpha, 0.0, 1.0);
+        p.audio_alpha = clamp(p.audio_alpha, 0.1, 1.0);  // Minimum alpha of 0.1
 
-        // Size driven by audio amplitude
-        p.audio_size = clamp(audio_level, 0.3, 1.5);
+        // Size driven by audio amplitude - BOOSTED
+        p.audio_size = clamp(audio_level * 1.3 + 0.5, 0.5, 2.0);
     } else {
         // Non-reactive mode: always visible
         p.audio_alpha = 1.0;
+        p.audio_size = 1.0;
     }
 
-    // Brightness from audio (matching preview)
-    p.brightness = select(0.5, 0.7 + audio_level * 0.2 + params.audio_beat * 0.1, has_audio);
+    // Brightness from audio - BOOSTED for better visibility
+    p.brightness = select(0.8, 1.0 + audio_level * 0.3 + params.audio_beat * 0.2, has_audio);
 
     // Life decay
     p.life -= dt;
@@ -1192,9 +1313,10 @@ fn vs_main(
     let quad_pos = QUAD_POSITIONS[local_vertex_idx];
     let quad_uv = QUAD_UVS[local_vertex_idx];
 
-    // Scale by particle size with glow extension - increased to match preview volumetric rendering
-    // Preview's draw_volumetric_particle uses radius up to size * 1.5, so we need larger quads
-    let glow_mult = 3.0 + params.glow_intensity * 1.5;
+    // Scale by particle size with glow extension - BOOSTED to match preview volumetric rendering
+    // Preview's draw_volumetric_particle draws multiple layers from size*0.1 to size*1.5
+    // We need larger quads to accommodate the full glow effect plus extra for smooth edges
+    let glow_mult = 5.0 + params.glow_intensity * 2.5;
     let size = p.size * p.audio_size * glow_mult;
 
     // Convert to clip space
@@ -1204,14 +1326,16 @@ fn vs_main(
 
     output.position = vec4<f32>(clip_x, clip_y, 0.0, 1.0);
 
-    // Compute alpha from life and audio - boost alpha for better visibility
+    // Compute alpha from life and audio - SIGNIFICANTLY boosted for better visibility
+    // Preview's particles are much more visible, so we need higher alpha
     let life_alpha = clamp(p.life / p.max_life, 0.0, 1.0);
-    let alpha = clamp(life_alpha * p.audio_alpha * p.brightness * 1.2, 0.0, 1.0);
+    let alpha = clamp(life_alpha * p.audio_alpha * p.brightness * 2.0, 0.0, 1.0);
 
-    // Use colors directly - matches preview rendering
-    output.color = vec4<f32>(p.color.rgb, alpha);
+    // Use colors directly with brightness boost - matches preview rendering
+    let boosted_color = p.color.rgb * 1.3;  // Boost color brightness
+    output.color = vec4<f32>(boosted_color, alpha);
     output.uv = quad_uv;
-    output.glow = params.glow_intensity;
+    output.glow = params.glow_intensity * 1.5;  // Boost glow intensity
 
     return output;
 }
@@ -1248,34 +1372,30 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // =========================================================
-    // EXACT MATCH to preview's draw_volumetric_particle()
-    // Preview iterates steps from outside in:
-    //   - t goes from 0.0 (step 0) to 1.0 (step = steps-1)
-    //   - radius = size * (0.1 + t * 1.4), so outer = size*1.5, inner = size*0.1
-    //   - gaussian = exp(-3.0 * t * t)
-    //   - center_boost = if t < 0.3 { 1.0 + (0.3 - t) * 2.0 } else { 1.0 }
-    //   - alpha = base_alpha * gaussian * center_boost * 0.7
+    // ENHANCED volumetric rendering to match preview quality
+    // Preview draws multiple concentric circles with varying alpha
+    // We simulate this with a smooth gradient that's brighter and more visible
     // =========================================================
 
     // t represents position in the gradient (0 = center, 1 = outer edge)
-    // This is inverted from preview's iteration order
     let t = clamp(dist, 0.0, 1.0);
 
-    // Gaussian falloff exactly as preview: exp(-3.0 * t^2)
-    let gaussian = exp(-3.0 * t * t);
+    // STRONGER Gaussian falloff for more visible core
+    // Using exp(-2.0 * t * t) instead of -3.0 for wider bright area
+    let gaussian = exp(-2.0 * t * t);
 
-    // Center brightness boost exactly as preview
-    // Note: preview uses (1.0 - t) for inner steps, so we use t directly
-    let inner_t = 1.0 - t;  // Convert to preview's t (0 at outer, 1 at center)
-    let center_boost = select(1.0, 1.0 + (inner_t - 0.7) * 2.0, inner_t > 0.7);
+    // STRONGER center brightness boost
+    // Creates a bright hot core that matches preview's layered rendering
+    let inner_t = 1.0 - t;  // 1 at center, 0 at edge
+    let center_boost = 1.0 + inner_t * inner_t * 2.0;  // Quadratic boost towards center
 
-    // Base intensity matching preview's 0.7 multiplier
-    let base_intensity = gaussian * center_boost * 0.7;
+    // Base intensity - increased from 0.7 to 1.0 for brighter particles
+    let base_intensity = gaussian * center_boost * 1.0;
 
-    // Glow extension - preview uses glow_intensity to scale outer fade
-    let glow_fade = exp(-1.5 * t * t) * input.glow * 0.5;
+    // Glow extension - wider and stronger glow halo
+    let glow_fade = exp(-1.0 * t * t) * input.glow * 0.8;
 
-    // Combine for total intensity
+    // Combine for total intensity with minimum brightness
     let intensity = base_intensity + glow_fade;
 
     // Convert input color to linear space for correct blending
@@ -1440,8 +1560,12 @@ fn soft_tonemap(color: vec3<f32>) -> vec3<f32> {
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     var hdr_color = textureSample(hdr_texture, tex_sampler, input.uv).rgb;
 
-    // Apply exposure
-    let exposure_mult = pow(2.0, params.exposure - 1.0);
+    // Sample bloom and add it to HDR color
+    let bloom_color = textureSample(bloom_texture, tex_sampler, input.uv).rgb;
+    hdr_color = hdr_color + bloom_color * params.bloom_strength * 1.5;
+
+    // Apply exposure - BOOSTED for brighter output
+    let exposure_mult = pow(2.0, params.exposure);
     hdr_color = hdr_color * exposure_mult;
 
     // Very gentle tone mapping that preserves colors
