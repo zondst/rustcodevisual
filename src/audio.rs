@@ -475,6 +475,7 @@ pub struct AudioSystem {
     sink: Arc<Sink>,
     pub analysis: Option<Arc<AudioAnalysis>>,
     pub audio_path: Option<String>,
+    is_stopped: bool, // Track if stop was called (sink is empty)
 }
 
 impl AudioSystem {
@@ -489,6 +490,7 @@ impl AudioSystem {
             sink,
             analysis: None,
             audio_path: None,
+            is_stopped: false,
         }
     }
 
@@ -500,17 +502,35 @@ impl AudioSystem {
         self.audio_path = Some(path.clone());
 
         // Load for playback
-        let file = File::open(&path)?;
-        let reader = BufReader::new(file);
-        let source = Decoder::new(reader)?;
-
-        self.sink.stop();
-        self.sink.append(source);
+        self.reload_audio_source()?;
+        self.is_stopped = false;
 
         Ok(())
     }
 
-    pub fn play(&self) {
+    /// Reload audio source from stored path (internal use)
+    fn reload_audio_source(&self) -> anyhow::Result<()> {
+        if let Some(ref path) = self.audio_path {
+            let file = File::open(path)?;
+            let reader = BufReader::new(file);
+            let source = Decoder::new(reader)?;
+
+            self.sink.stop();
+            self.sink.append(source);
+            self.sink.pause(); // Start paused, will play when play() is called
+        }
+        Ok(())
+    }
+
+    pub fn play(&mut self) {
+        // If stopped, reload the audio source first
+        if self.is_stopped || self.sink.empty() {
+            if let Err(e) = self.reload_audio_source() {
+                eprintln!("Failed to reload audio: {}", e);
+                return;
+            }
+            self.is_stopped = false;
+        }
         self.sink.play();
     }
 
@@ -518,8 +538,9 @@ impl AudioSystem {
         self.sink.pause();
     }
 
-    pub fn stop(&self) {
+    pub fn stop(&mut self) {
         self.sink.stop();
+        self.is_stopped = true;
     }
 
     #[allow(dead_code)]

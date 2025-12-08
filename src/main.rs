@@ -800,15 +800,17 @@ impl ParticleStudioApp {
             }
         });
         
-        // Duration
+        // Duration - support full audio length (up to 24 hours max)
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.label("Duration:");
+            // Get max duration - either full audio length or 86400 seconds (24 hours)
+            let max_duration = self.audio_sys.get_duration().unwrap_or(86400.0).max(1.0);
             ui.add(egui::DragValue::new(&mut self.export_duration_secs)
                 .suffix(" sec")
-                .clamp_range(1.0..=600.0)
+                .clamp_range(1.0..=max_duration)
                 .speed(0.5));
-            
+
             if ui.button("10s").clicked() {
                 self.export_duration_secs = 10.0;
             }
