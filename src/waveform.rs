@@ -1,7 +1,7 @@
 //! Waveform Visualizer for Particle Studio RS
 //! Audio waveform visualization with multiple styles
 
-use egui::{Color32, Painter, Pos2, Rect, Vec2};
+use egui::{Color32, Painter, Pos2, Rect};
 use crate::config::{WaveformConfig, WaveformStyle, ColorScheme};
 use crate::audio::AudioState;
 

@@ -1,19 +1,17 @@
 //! Compositor for Particle Studio RS
 //! Combines all visualization layers and handles video export
 
-use image::{Rgb, RgbImage, ImageBuffer};
+use image::ImageBuffer;
 use std::process::{Command, Stdio, Child};
 use std::io::Write;
-use std::sync::Arc;
 
-use crate::config::{AppConfig, ColorScheme};
+use crate::config::AppConfig;
 use crate::audio::{AudioState, AudioAnalysis};
 use crate::particles::ParticleEngine;
-use crate::spectrum::SpectrumVisualizer;
-use crate::waveform::WaveformVisualizer;
 use crate::postprocess::{PostProcessor, BackgroundRenderer, FrameBuffer};
 
 /// Frame compositor combining all layers
+#[allow(dead_code)]
 pub struct Compositor {
     pub width: u32,
     pub height: u32,
@@ -102,6 +100,7 @@ impl Compositor {
 }
 
 /// Video renderer for exporting to file
+#[allow(dead_code)]
 pub struct VideoRenderer {
     width: u32,
     height: u32,
@@ -203,6 +202,7 @@ impl VideoRenderer {
 }
 
 /// Render an entire visualization to video
+#[allow(dead_code)]
 pub fn render_to_video(
     config: &AppConfig,
     analysis: &AudioAnalysis,

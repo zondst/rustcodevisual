@@ -109,7 +109,7 @@ impl ParticleStudioApp {
         visuals.panel_fill = egui::Color32::from_rgba_unmultiplied(20, 20, 35, 240);
         cc.egui_ctx.set_visuals(visuals);
         
-        let mut config = AppConfig::default();
+        let config = AppConfig::default();
         let colors = config.get_color_scheme();
         
         let mut particles = ParticleEngine::new(1280.0, 720.0);

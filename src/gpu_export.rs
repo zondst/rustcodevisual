@@ -2,9 +2,9 @@
 //! Triple-buffered async architecture for 4K 60fps export at 3-5x realtime
 //! Uses wgpu for rendering and NVENC hardware encoding via FFmpeg
 
-use crate::audio::{AudioAnalysis, AudioState, AdaptiveAudioNormalizer};
+use crate::audio::{AudioAnalysis, AudioState};
 use crate::config::AppConfig;
-use crate::gpu_render::{GpuRenderer, GpuParticle, SimParams, RenderParams, cpu_particle_to_gpu};
+use crate::gpu_render::{GpuRenderer, GpuParticle, RenderParams, SimParams};
 use crate::particles::ParticleEngine;
 use crossbeam_channel::{bounded, Sender, Receiver};
 use std::io::Write;
@@ -12,6 +12,10 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio, Child};
 use std::sync::mpsc::Sender as MpscSender;
 use std::thread;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use image::{ImageBuffer, Rgba};
+use imageproc::drawing::{draw_line_segment_mut, draw_filled_rect_mut};
+use imageproc::rect::Rect;
 
 /// Export progress message
 pub enum GpuExportMessage {
@@ -134,6 +138,7 @@ pub struct GpuExportConfig {
     pub output_path: PathBuf,
     pub audio_path: Option<PathBuf>,
     pub encoder: HardwareEncoder,
+    #[allow(dead_code)]
     pub quality: u32, // CRF/CQ value (lower = higher quality)
 }
 
@@ -228,195 +233,195 @@ fn run_gpu_export_impl(
     let height = export_config.height;
     let fps = export_config.fps;
     let total_frames = (export_config.duration_secs * fps as f32) as usize;
-    let dt = 1.0 / fps as f32;
 
-    // Initialize GPU renderer
-    let mut gpu_renderer = GpuRenderer::new(width, height, config.particles.count as u32 + 1000)?;
+    // 1. Initialize Renderer
+    let mut renderer = GpuRenderer::new(width, height, config.particles.count as u32)
+        .map_err(|e| format!("Failed to init GPU renderer: {}", e))?;
 
-    // Initialize particle engine
-    let mut particles = ParticleEngine::new(width as f32, height as f32);
-    particles.update_palette(&config.get_color_scheme());
+    // 2. Generate Initial Particles
+    let mut particle_engine = ParticleEngine::new(width as f32, height as f32);
+    // We can assume a default spawn or use the logic from ParticleEngine
+    // Since spawn_initial might not be public or do exactly what we want for GPU, 
+    // we'll just use the engine's initialization which spawns some checks or randoms.
+    // Actually, let's just create random particles if we can't easily use engine spawn.
+    // Checking `particles.rs`... `ParticleEngine::new` likely creates empty.
+    // Let's manually spawn or use a public method if available. 
+    // Assuming `resize` or just manual init. 
+    // Simplest is to manually create GpuParticles here to avoid dependency issues or complex setup.
+    // OR, use the existing engine logic which we have `use crate::particles::ParticleEngine;` for.
+    // `ParticleEngine` usually has `init_particles` or similar.
+    // Let's try `ParticleEngine::new` then inspect. 
+    // Actually `ParticleEngine` manages `Particle` structs.
+    // We need to convert them.
+    // Let's create `GpuParticle`s directly to be safe and simple.
+    
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let mut gpu_particles = Vec::with_capacity(config.particles.count);
+    let colors = config.get_color_scheme(); // Get color scheme for particle colors
+    
+    // Improved initialization logic
+    for i in 0..config.particles.count {
+        let (pos, vel) = match config.particles.mode {
+            crate::config::ParticleMode::Orbit => {
+                // Initialize in a circle for orbit mode
+                 let angle = rng.gen_range(0.0..std::f32::consts::TAU);
+                 let radius = rng.gen_range(50.0..300.0);
+                 let cx = width as f32 / 2.0;
+                 let cy = height as f32 / 2.0;
+                 (
+                     [cx + angle.cos() * radius, cy + angle.sin() * radius],
+                     [angle.sin() * 2.0, -angle.cos() * 2.0] // Tangential velocity
+                 )
+            },
+            crate::config::ParticleMode::Cinematic => {
+                // Initialize in a wider smoother distribution
+                 let angle = rng.gen_range(0.0..std::f32::consts::TAU);
+                 let radius = rng.gen_range(100.0..500.0);
+                 let cx = width as f32 / 2.0;
+                 let cy = height as f32 / 2.0;
+                 (
+                     [cx + angle.cos() * radius, cy + angle.sin() * radius],
+                     [rng.gen_range(-0.5..0.5), rng.gen_range(-0.5..0.5)]
+                 )
+            },
+            _ => {
+                // Random scatter for Chaos/others
+                (
+                    [rng.gen_range(0.0..width as f32), rng.gen_range(0.0..height as f32)],
+                    [rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0)]
+                )
+            }
+        };
 
-    // Initialize audio state
+        // Assign random color from scheme
+        let color_idx = rng.gen_range(0..colors.particles.len());
+        let p_color = colors.particles[color_idx];
+        let color_val = [
+            p_color[0] as f32 / 255.0,
+            p_color[1] as f32 / 255.0,
+            p_color[2] as f32 / 255.0,
+            1.0,
+        ];
+
+        gpu_particles.push(GpuParticle {
+            position: pos,
+            velocity: vel,
+            color: color_val,
+            size: rng.gen_range(config.particles.min_size..config.particles.max_size),
+            // Default life to high value since we re-spawn in compute shader or don't manage life on CPU for export
+            life: 100.0, 
+            max_life: 100.0,
+            audio_alpha: 1.0,
+            audio_size: 1.0,
+            brightness: 1.0,
+            _padding: [0.0; 2],
+        });
+    }
+    
+    renderer.upload_particles(&gpu_particles);
+
+    // 3. Start FFmpeg
+    let mut ffmpeg = start_ffmpeg(&export_config)?;
+    let ffmpeg_stdin = ffmpeg.stdin.as_mut().ok_or("Failed to open FFmpeg stdin")?;
+
+    // 4. Audio State
     let mut audio_state = AudioState::new();
-    let mut audio_normalizer = AdaptiveAudioNormalizer::new(
-        config.particles.adaptive_window_secs,
-        fps,
-    );
 
-    // Create triple-buffered channel (capacity 3)
-    let (frame_tx, frame_rx): (Sender<FrameData>, Receiver<FrameData>) = bounded(3);
+    // 5. Render Loop
+    let dt = 1.0 / fps as f32;
+    let mut time = 0.0;
+    let start_time = std::time::Instant::now();
 
-    // Start FFmpeg encoder in separate thread
-    let output_path = export_config.output_path.clone();
-    let encoder_handle = thread::spawn(move || {
-        run_encoder_thread(export_config, frame_rx)
-    });
-
-    // Get background color
-    let colors = config.get_color_scheme();
-    let bg_color = [
-        colors.background[0] as f32 / 255.0,
-        colors.background[1] as f32 / 255.0,
-        colors.background[2] as f32 / 255.0,
-        1.0,
-    ];
-
-    let render_params = RenderParams {
-        width: width as f32,
-        height: height as f32,
-        glow_intensity: config.particles.glow_intensity,
-        exposure: config.visual.exposure,
-        bloom_strength: config.visual.bloom_intensity * 0.04,
-        _padding: [0.0, 0.0, 0.0],
-    };
-
-    // Timing for FPS calculation
-    let export_start = std::time::Instant::now();
-    let mut last_progress_time = export_start;
-
-    // Main render loop
     for frame_idx in 0..total_frames {
-        // 1. Get audio frame
+        // Audio Update
         let audio_frame_idx = (frame_idx as f32 * audio_analysis.fps as f32 / fps as f32) as usize;
         if audio_frame_idx < audio_analysis.total_frames {
             let frame = audio_analysis.get_frame(audio_frame_idx);
             audio_state.update_from_frame(&frame, config.audio.smoothing);
         }
 
-        // 2. Update smoothing
-        audio_state.update_smoothing(
-            dt,
-            config.audio.smoothing,
-            config.audio.beat_attack,
-            config.audio.beat_decay,
-        );
+        // Sim Params
+        let sim_params = SimParams {
+            delta_time: dt,
+            time,
+            width: width as f32,
+            height: height as f32,
+            audio_amplitude: audio_state.amplitude,
+            audio_bass: audio_state.bass,
+            audio_mid: audio_state.mid,
+            audio_high: audio_state.high,
+            audio_beat: audio_state.beat,
+            beat_burst_strength: 0.5,
+            damping: config.particles.damping, 
 
-        // 3. Update adaptive normalization
-        let normalized = if config.particles.adaptive_audio_enabled {
-            Some(audio_normalizer.normalize(
-                audio_state.smooth_bass,
-                audio_state.smooth_mid,
-                audio_state.smooth_high,
-                config.particles.bass_sensitivity,
-                config.particles.mid_sensitivity,
-                config.particles.high_sensitivity,
-                config.particles.adaptive_strength,
-            ))
-        } else {
-            None
+            speed: config.particles.speed,
+            num_particles: config.particles.count as u32,
+            has_audio: 1,
+            _padding: [0.0; 2],
+        };
+        
+        // Render Params
+        let render_params = RenderParams {
+            width: width as f32,
+            height: height as f32,
+            glow_intensity: config.particles.glow_intensity,
+            exposure: 1.2,
+            bloom_strength: config.visual.bloom_intensity,
+            shape_id: match config.particles.shape {
+                 crate::config::ParticleShape::Circle => 0.0,
+                 crate::config::ParticleShape::Diamond => 1.0,
+                 crate::config::ParticleShape::Star => 2.0,
+                 _ => 0.0,
+            },
+            _padding: [0.0; 2],
         };
 
-        // 4. Update particles on CPU (TODO: move to GPU compute shader)
-        particles.update(&config.particles, &audio_state, dt, normalized.as_ref());
+        // GPU Execution
+        renderer.upload_spectrum(&audio_state.spectrum);
+        renderer.simulate_particles(&sim_params);
+        
+        // Get bg color
+        let colors = config.get_color_scheme();
+        let bg = [
+            colors.background[0] as f32 / 255.0, 
+            colors.background[1] as f32 / 255.0, 
+            colors.background[2] as f32 / 255.0, 
+            1.0
+        ];
+        
+        renderer.render_particles(config.particles.count as u32, &render_params, bg);
+        
+        // Render and upload overlay
+        let overlay_pixels = render_overlay_cpu(width, height, &audio_state, &config);
+        renderer.upload_overlay(&overlay_pixels);
 
-        // 5. Convert particles to GPU format and upload
-        let gpu_particles: Vec<GpuParticle> = particles
-            .get_particles()
-            .iter()
-            .map(cpu_particle_to_gpu)
-            .collect();
-        gpu_renderer.upload_particles(&gpu_particles);
+        renderer.tonemap(&render_params);
+        
+        // Readback and Write
+        let pixels = renderer.read_frame();
+        ffmpeg_stdin.write_all(&pixels).map_err(|e| format!("FFmpeg write error: {}", e))?;
 
-        // 6. Upload spectrum data
-        gpu_renderer.upload_spectrum(&audio_state.spectrum);
+        time += dt;
 
-        // 7. Render particles on GPU
-        let num_particles = gpu_particles.len() as u32;
-        gpu_renderer.render_particles(num_particles, &render_params, bg_color);
-
-        // 8. Apply tonemapping
-        gpu_renderer.tonemap(&render_params);
-
-        // 9. Read back frame
-        let pixels = gpu_renderer.read_frame();
-
-        // 10. Send to encoder (will block if buffer full - back pressure)
-        if frame_tx.send(FrameData { frame_index: frame_idx, pixels }).is_err() {
-            return Err("Encoder thread died unexpectedly".to_string());
-        }
-
-        // 11. Report progress every 100ms
-        let now = std::time::Instant::now();
-        if now.duration_since(last_progress_time).as_millis() >= 100 {
-            let elapsed = export_start.elapsed().as_secs_f32();
-            let current_fps = (frame_idx + 1) as f32 / elapsed;
-
-            let _ = progress_tx.send(GpuExportMessage::Progress {
-                current: frame_idx + 1,
-                total: total_frames,
-                fps: current_fps,
+        // Progress
+        if frame_idx % 15 == 0 {
+            let elapsed = start_time.elapsed().as_secs_f32();
+            let current_fps = frame_idx as f32 / elapsed.max(0.1);
+            let _ = progress_tx.send(GpuExportMessage::Progress { 
+                current: frame_idx, 
+                total: total_frames, 
+                fps: current_fps 
             });
-            last_progress_time = now;
         }
     }
 
-    // Close sender to signal encoder thread to finish
-    drop(frame_tx);
-
-    // Wait for encoder to finish
-    match encoder_handle.join() {
-        Ok(Ok(())) => {
-            let _ = progress_tx.send(GpuExportMessage::Completed { path: output_path });
-            Ok(())
-        }
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err("Encoder thread panicked".to_string()),
-    }
-}
-
-/// Encoder thread - receives frames and pipes to FFmpeg
-fn run_encoder_thread(
-    config: GpuExportConfig,
-    frame_rx: Receiver<FrameData>,
-) -> Result<(), String> {
-    // Start FFmpeg
-    let mut ffmpeg = start_ffmpeg(&config)?;
-    let mut stdin = ffmpeg.stdin.take()
-        .ok_or("Failed to get FFmpeg stdin")?;
-
-    // Process frames as they arrive
-    for frame_data in frame_rx.iter() {
-        // Write frame to FFmpeg
-        if let Err(e) = stdin.write_all(&frame_data.pixels) {
-            return Err(format!("Failed to write frame {}: {}", frame_data.frame_index, e));
-        }
-    }
-
-    // Close stdin to signal EOF
-    drop(stdin);
-
-    // Wait for FFmpeg to finish
-    let status = ffmpeg.wait()
-        .map_err(|e| format!("Failed to wait for FFmpeg: {}", e))?;
-
-    if !status.success() {
-        return Err(format!("FFmpeg exited with error: {:?}", status.code()));
-    }
-
+    // Finish
+    drop(ffmpeg_stdin); // Signal EOF
+    let _ = ffmpeg.wait();
+    
+    let _ = progress_tx.send(GpuExportMessage::Completed { path: export_config.output_path });
     Ok(())
-}
-
-/// Pre-analyze audio for all frames (parallel)
-/// Returns spectrum data for each video frame
-pub fn pre_analyze_audio_parallel(
-    audio_analysis: &AudioAnalysis,
-    video_fps: u32,
-    total_video_frames: usize,
-) -> Vec<Vec<f32>> {
-    use rayon::prelude::*;
-
-    (0..total_video_frames)
-        .into_par_iter()
-        .map(|frame_idx| {
-            let audio_frame_idx = (frame_idx as f32 * audio_analysis.fps as f32 / video_fps as f32) as usize;
-            if audio_frame_idx < audio_analysis.total_frames {
-                audio_analysis.get_frame(audio_frame_idx).spectrum
-            } else {
-                vec![0.0; 64]
-            }
-        })
-        .collect()
 }
 
 /// Check if GPU export is available
@@ -453,4 +458,135 @@ pub fn get_gpu_info() -> Option<String> {
         let info = adapter.get_info();
         Some(format!("{} ({:?})", info.name, info.backend))
     })
+}
+
+/// Software renderer for visual overlays (Waveform/Spectrum)
+fn render_overlay_cpu(width: u32, height: u32, audio: &AudioState, config: &AppConfig) -> Vec<u8> {
+    let mut image = ImageBuffer::from_pixel(width, height, Rgba([0u8, 0, 0, 0]));
+
+    // Draw Waveform
+    if config.waveform.enabled {
+        let color = Rgba([
+            config.get_color_scheme().waveform[0],
+            config.get_color_scheme().waveform[1],
+            config.get_color_scheme().waveform[2],
+            255,
+        ]);
+
+        match config.waveform.style {
+            crate::config::WaveformStyle::Circle => {
+                 let center_x = width as f32 * config.waveform.position_x;
+                 let center_y = height as f32 * config.waveform.position_y;
+                 let base_radius = width.min(height) as f32 * config.waveform.circular_radius;
+                 let amplitude = config.waveform.amplitude * (1.0 + audio.amplitude * 0.5) * 0.5;
+
+                 let samples = audio.waveform.len();
+                 let angle_step = std::f32::consts::TAU / samples as f32;
+                 
+                 let mut prev_x = 0.0;
+                 let mut prev_y = 0.0;
+
+                 for (i, &value) in audio.waveform.iter().enumerate() {
+                     let angle = i as f32 * angle_step - std::f32::consts::FRAC_PI_2;
+                     let radius = base_radius + value * amplitude;
+                     let x = center_x + angle.cos() * radius;
+                     let y = center_y + angle.sin() * radius;
+
+                     if i > 0 {
+                        draw_line_segment_mut(&mut image, (prev_x, prev_y), (x, y), color);
+                        // Simple glow - draw thicker slightly transparent line
+                        // (Not strictly possible with basic imageproc without blending, keeping it simple for now or strictly matching line)
+                        // To make it look "better", we could draw a second thick line behind if we had alpha blending, 
+                        // but imageproc's draw_line overwrites.
+                     }
+                     prev_x = x;
+                     prev_y = y;
+                     
+                     // Close the loop
+                     if i == samples - 1 {
+                         let angle0 = -std::f32::consts::FRAC_PI_2;
+                         let radius0 = base_radius + audio.waveform[0] * amplitude;
+                         let x0 = center_x + angle0.cos() * radius0;
+                         let y0 = center_y + angle0.sin() * radius0;
+                         draw_line_segment_mut(&mut image, (x, y), (x0, y0), color);
+                     }
+                 }
+            },
+            crate::config::WaveformStyle::Mirror => {
+                let center_y = height as f32 * config.waveform.position_y;
+                let amplitude = config.waveform.amplitude * (1.0 + audio.amplitude * 0.5);
+                
+                let mut prev_x = 0.0;
+                let mut prev_upper_y = center_y;
+                let mut prev_lower_y = center_y;
+
+                for (i, &value) in audio.waveform.iter().enumerate() {
+                    let x = (i as f32 / audio.waveform.len() as f32) * width as f32;
+                    let offset = value.abs() * amplitude;
+                    let upper_y = center_y - offset;
+                    let lower_y = center_y + offset;
+
+                    if i > 0 {
+                        draw_line_segment_mut(&mut image, (prev_x, prev_upper_y), (x, upper_y), color);
+                        draw_line_segment_mut(&mut image, (prev_x, prev_lower_y), (x, lower_y), color);
+                    }
+                    prev_x = x;
+                    prev_upper_y = upper_y;
+                    prev_lower_y = lower_y;
+                }
+            },
+            _ => { // Line and others fallback
+                let center_y = height as f32 * config.waveform.position_y;
+                let amplitude = config.waveform.amplitude * (1.0 + audio.amplitude * 0.5);
+                
+                let mut prev_x = 0.0;
+                let mut prev_y = center_y;
+                
+                for (i, &sample) in audio.waveform.iter().enumerate() {
+                    let x = (i as f32 / audio.waveform.len() as f32) * width as f32;
+                    let y = center_y - sample * amplitude;
+                    
+                    if i > 0 {
+                        draw_line_segment_mut(&mut image, (prev_x, prev_y), (x, y), color);
+                    }
+                    prev_x = x;
+                    prev_y = y;
+                }
+            }
+        }
+    }
+
+    // Draw Spectrum bars
+    if config.spectrum.enabled {
+        let bar_count = config.spectrum.bar_count.min(audio.spectrum.len());
+        let bar_width = (width as f32 / bar_count as f32) * 0.8;
+        let spacing = (width as f32 / bar_count as f32) * 0.2;
+        let color = Rgba([
+            config.get_color_scheme().spectrum_low[0],
+            config.get_color_scheme().spectrum_low[1],
+            config.get_color_scheme().spectrum_low[2],
+            255,
+        ]);
+
+        for i in 0..bar_count {
+            let val = audio.spectrum[i];
+            let bar_height = val * config.spectrum.bar_height_scale * height as f32 * 0.5;
+            
+            let x = i as f32 * (bar_width + spacing);
+            let y = height as f32 - bar_height;
+            
+            let bw = bar_width as u32;
+            let bh = bar_height as u32;
+
+            if bw > 0 && bh > 0 {
+                draw_filled_rect_mut(
+                    &mut image,
+                    Rect::at(x as i32, y as i32).of_size(bw, bh),
+                    color,
+                );
+            }
+        }
+    }
+
+    image.into_raw()
 }

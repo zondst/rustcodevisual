@@ -1,18 +1,12 @@
-//! Preset System for Particle Studio RS
-//! Defines visual presets: Particles GPU, Audio Fractals, VJ Reactive, Bloom Intensive
-
 use serde::{Deserialize, Serialize};
-use crate::config::{
-    ParticleConfig, VisualConfig, AudioConfig, PhysicsConfig, 
-    ParticleMode, ParticleShape, BlendMode, SpectrumStyle, WaveformStyle
-};
+use crate::config::{ParticleMode, ParticleShape, SpectrumStyle, WaveformStyle};
 
-/// Available preset types inspired by sample projects
+/// Available preset types
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PresetType {
-    /// Default balanced visualization
+    /// Default balanced preset
     Default,
-    /// GPU compute-style particle simulation (from rust-particles-main)
+    /// Particles GPU preset (from rust-particles-main)
     ParticlesGPU,
     /// Raymarched fractal backgrounds with audio reactivity (from fractal_sugar)
     AudioFractals,
@@ -67,6 +61,7 @@ impl PresetType {
 
 /// Complete preset configuration
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct PresetConfig {
     pub preset_type: PresetType,
     pub particles: ParticlePreset,
@@ -83,6 +78,7 @@ impl Default for PresetConfig {
 
 /// Particle configuration for presets
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct ParticlePreset {
     pub count: usize,
     pub min_size: f32,
@@ -121,6 +117,7 @@ impl Default for ParticlePreset {
 
 /// Visual effects configuration for presets
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct VisualsPreset {
     pub bloom_enabled: bool,
     pub bloom_intensity: f32,
@@ -161,6 +158,7 @@ impl Default for VisualsPreset {
 
 /// Audio reactivity configuration for presets
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct AudioPreset {
     pub smoothing: f32,
     pub beat_sensitivity: f32,
@@ -195,6 +193,7 @@ impl Default for AudioPreset {
 
 /// Fractal rendering configuration for presets
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct FractalPreset {
     pub enabled: bool,
     pub fractal_type: FractalType,
@@ -223,6 +222,7 @@ impl Default for FractalPreset {
 
 /// Fractal types from fractal_sugar
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub enum FractalType {
     /// No fractal (particles only)
     None,

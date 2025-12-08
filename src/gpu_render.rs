@@ -52,7 +52,8 @@ pub struct RenderParams {
     pub glow_intensity: f32,
     pub exposure: f32,
     pub bloom_strength: f32,
-    pub _padding: [f32; 3],
+    pub shape_id: f32,
+    pub _padding: [f32; 2],
 }
 
 /// GPU-accelerated headless renderer
@@ -69,6 +70,10 @@ pub struct GpuRenderer {
     // Bloom textures (mip chain)
     bloom_textures: Vec<wgpu::Texture>,
     bloom_views: Vec<wgpu::TextureView>,
+    
+    // Overlay texture (Waveform/Spectrum)
+    overlay_texture: wgpu::Texture,
+    overlay_view: wgpu::TextureView,
 
     // Staging buffer for CPU readback
     staging_buffer: wgpu::Buffer,
@@ -215,6 +220,19 @@ impl GpuRenderer {
             mip_width /= 2;
             mip_height /= 2;
         }
+
+        // Create Overlay texture
+        let overlay_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Overlay Texture"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let overlay_view = overlay_texture.create_view(&wgpu::TextureViewDescriptor::default());    
 
         // Staging buffer for GPU->CPU transfer (aligned to 256 bytes)
         let bytes_per_row = (width * 4 + 255) & !255;
@@ -525,6 +543,16 @@ impl GpuRenderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -567,6 +595,8 @@ impl GpuRenderer {
             render_view,
             hdr_texture,
             hdr_view,
+            overlay_texture,
+            overlay_view,
             bloom_textures,
             bloom_views,
             staging_buffer,
@@ -604,6 +634,29 @@ impl GpuRenderer {
         let len = spectrum.len().min(64);
         padded[..len].copy_from_slice(&spectrum[..len]);
         self.queue.write_buffer(&self.spectrum_buffer, 0, bytemuck::cast_slice(&padded));
+    }
+
+    /// Upload overlay image (rgba8)
+    pub fn upload_overlay(&self, pixels: &[u8]) {
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.overlay_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            pixels,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(self.width * 4),
+                rows_per_image: Some(self.height),
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 
     /// Run particle simulation compute shader
@@ -732,6 +785,10 @@ impl GpuRenderer {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: self.render_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&self.overlay_view),
                 },
             ],
         });
@@ -966,7 +1023,9 @@ struct RenderParams {
     glow_intensity: f32,
     exposure: f32,
     bloom_strength: f32,
-    _padding: vec3<f32>,
+    shape_id: f32,
+    _pad2: f32,
+    _pad3: f32,
 }
 
 struct VertexOutput {
@@ -993,6 +1052,9 @@ var<private> QUAD_UVS: array<vec2<f32>, 6> = array<vec2<f32>, 6>(
     vec2<f32>(1.0, 1.0),
     vec2<f32>(0.0, 1.0)
 );
+
+@group(0) @binding(0) var<storage, read> particles: array<Particle>;
+@group(0) @binding(1) var<uniform> params: RenderParams;
 
 @vertex
 fn vs_main(
@@ -1041,7 +1103,23 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Distance from center of quad
     let center = vec2<f32>(0.5, 0.5);
     let uv = input.uv;
-    let dist = length(uv - center) * 2.0;
+    var dist = 0.0;
+
+    // Shape selection
+    if (abs(params.shape_id - 1.0) < 0.1) {
+        // Diamond
+        dist = abs(uv.x - center.x) + abs(uv.y - center.y);
+        dist = dist * 2.0; // Normalize to roughly circle size
+    } else if (abs(params.shape_id - 2.0) < 0.1) {
+        // Star (Approx 4-point)
+        let d1 = abs(uv.x - center.x) * 4.0; // Thin horizontal
+        let d2 = abs(uv.y - center.y) * 4.0; // Thin vertical
+        // Combine soft cross
+        dist = min(d1, d2) + length(uv - center) * 0.5;
+    } else {
+        // Circle (Default)
+        dist = length(uv - center) * 2.0;
+    }
 
     // Gaussian falloff for soft glow effect
     let gaussian = exp(-3.0 * dist * dist);
@@ -1139,7 +1217,9 @@ struct RenderParams {
     glow_intensity: f32,
     exposure: f32,
     bloom_strength: f32,
-    _padding: vec3<f32>,
+    shape_id: f32,
+    _pad2: f32,
+    _pad3: f32,
 }
 
 struct VertexOutput {
@@ -1151,6 +1231,7 @@ struct VertexOutput {
 @group(0) @binding(1) var bloom_texture: texture_2d<f32>;
 @group(0) @binding(2) var tex_sampler: sampler;
 @group(0) @binding(3) var<uniform> params: RenderParams;
+@group(0) @binding(4) var overlay_texture: texture_2d<f32>;
 
 // Fullscreen triangle
 @vertex
@@ -1193,6 +1274,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     // Gamma correction (sRGB)
     color = pow(color, vec3<f32>(1.0 / 2.2));
+
+    // Composite overlay
+    let overlay = textureSample(overlay_texture, tex_sampler, input.uv);
+    color = mix(color, overlay.rgb, overlay.a);
 
     return vec4<f32>(color, 1.0);
 }

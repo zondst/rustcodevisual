@@ -628,6 +628,7 @@ impl AppConfig {
             .unwrap_or_default()
     }
     
+    #[allow(dead_code)]
     pub fn set_color_scheme(&mut self, index: usize) {
         let schemes = ColorScheme::all_schemes();
         if index < schemes.len() {
