@@ -361,13 +361,13 @@ fn run_gpu_export_impl(
             _padding: [0.0; 2],
         };
         
-        // Render Params - exposure tuned to preserve colors
+        // Render Params - matched to preview quality
         let render_params = RenderParams {
             width: width as f32,
             height: height as f32,
             glow_intensity: config.particles.glow_intensity,
-            exposure: 0.8, // Reduced to prevent color washout
-            bloom_strength: config.visual.bloom_intensity * 0.5, // Reduced bloom
+            exposure: 1.0, // Full exposure to match preview
+            bloom_strength: config.visual.bloom_intensity, // Full bloom to match preview
             shape_id: match config.particles.shape {
                  crate::config::ParticleShape::Circle => 0.0,
                  crate::config::ParticleShape::Diamond => 1.0,
@@ -460,7 +460,7 @@ pub fn get_gpu_info() -> Option<String> {
     })
 }
 
-/// Draw an anti-aliased line with glow effect
+/// Draw an anti-aliased line with glow effect (enhanced to match preview quality)
 fn draw_line_with_glow(
     image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
     start: (f32, f32),
@@ -469,15 +469,23 @@ fn draw_line_with_glow(
     thickness: f32,
     glow_alpha: u8,
 ) {
-    // Draw outer glow first (wider, more transparent)
-    let glow_color = Rgba([color[0], color[1], color[2], glow_alpha / 3]);
-    draw_antialiased_line_with_thickness(image, start, end, glow_color, thickness * 3.0);
+    // Draw outer glow first (wider, more transparent) - enhanced for preview match
+    let outer_glow_color = Rgba([color[0], color[1], color[2], glow_alpha / 4]);
+    draw_antialiased_line_with_thickness(image, start, end, outer_glow_color, thickness * 5.0);
 
-    // Draw mid glow
-    let mid_glow_color = Rgba([color[0], color[1], color[2], glow_alpha / 2]);
-    draw_antialiased_line_with_thickness(image, start, end, mid_glow_color, thickness * 2.0);
+    // Draw mid-outer glow
+    let mid_outer_glow = Rgba([color[0], color[1], color[2], glow_alpha / 3]);
+    draw_antialiased_line_with_thickness(image, start, end, mid_outer_glow, thickness * 3.5);
 
-    // Draw main line
+    // Draw mid glow (brighter)
+    let mid_glow_color = Rgba([color[0], color[1], color[2], (glow_alpha as u16 * 2 / 3).min(255) as u8]);
+    draw_antialiased_line_with_thickness(image, start, end, mid_glow_color, thickness * 2.5);
+
+    // Draw inner glow
+    let inner_glow = Rgba([color[0], color[1], color[2], glow_alpha]);
+    draw_antialiased_line_with_thickness(image, start, end, inner_glow, thickness * 1.5);
+
+    // Draw main line (full brightness)
     let main_color = Rgba([color[0], color[1], color[2], 255]);
     draw_antialiased_line_with_thickness(image, start, end, main_color, thickness);
 }
@@ -585,11 +593,13 @@ fn render_overlay_cpu(width: u32, height: u32, audio: &AudioState, config: &AppC
     let mut image = ImageBuffer::from_pixel(width, height, Rgba([0u8, 0, 0, 0]));
     let colors = config.get_color_scheme();
 
-    // Draw Waveform
+    // Draw Waveform (enhanced for preview quality match)
     if config.waveform.enabled {
         let waveform_color = colors.waveform;
-        let thickness = config.waveform.thickness.max(2.0);
-        let glow_alpha = ((audio.amplitude * 150.0).min(200.0) + 55.0) as u8;
+        // Boost thickness to match preview quality (minimum 3.0 for visibility)
+        let thickness = config.waveform.thickness.max(3.0) * 1.5;
+        // Enhanced glow alpha for better visibility
+        let glow_alpha = ((audio.amplitude * 180.0).min(220.0) + 80.0).min(255.0) as u8;
 
         match config.waveform.style {
             crate::config::WaveformStyle::Circle => {
@@ -717,16 +727,41 @@ fn render_overlay_cpu(width: u32, height: u32, audio: &AudioState, config: &AppC
             ];
 
             if bw > 0 && bh > 0 {
-                // Draw glow (larger, semi-transparent)
-                let glow_color = Rgba([bar_color[0], bar_color[1], bar_color[2], (boosted_val * 100.0) as u8]);
-                let glow_rect = Rect::at((x - 2).max(0), (y - 4).max(0))
-                    .of_size((bw + 4).min(width - x as u32), (bh + 8).min(height));
-                draw_filled_rect_mut(&mut image, glow_rect, glow_color);
+                // Draw outer glow (largest, most transparent) - enhanced for preview match
+                let outer_glow = Rgba([bar_color[0], bar_color[1], bar_color[2], (boosted_val * 40.0) as u8]);
+                let outer_rect = Rect::at((x - 4).max(0), (y - 8).max(0))
+                    .of_size((bw + 8).min(width - x.max(0) as u32), (bh + 16).min(height));
+                draw_filled_rect_mut(&mut image, outer_rect, outer_glow);
 
-                // Draw main bar
+                // Draw mid glow
+                let mid_glow = Rgba([bar_color[0], bar_color[1], bar_color[2], (boosted_val * 80.0) as u8]);
+                let mid_rect = Rect::at((x - 2).max(0), (y - 4).max(0))
+                    .of_size((bw + 4).min(width - x.max(0) as u32), (bh + 8).min(height));
+                draw_filled_rect_mut(&mut image, mid_rect, mid_glow);
+
+                // Draw inner glow
+                let inner_glow = Rgba([bar_color[0], bar_color[1], bar_color[2], (boosted_val * 150.0).min(200.0) as u8]);
+                let inner_rect = Rect::at((x - 1).max(0), (y - 2).max(0))
+                    .of_size((bw + 2).min(width - x.max(0) as u32), (bh + 4).min(height));
+                draw_filled_rect_mut(&mut image, inner_rect, inner_glow);
+
+                // Draw main bar (full opacity)
                 let main_color = Rgba([bar_color[0], bar_color[1], bar_color[2], 255]);
                 let bar_rect = Rect::at(x, y).of_size(bw, bh);
                 draw_filled_rect_mut(&mut image, bar_rect, main_color);
+
+                // Draw bright top cap
+                let cap_height = (2).min(bh as i32);
+                if cap_height > 0 {
+                    let cap_color = Rgba([
+                        (bar_color[0] as u16 + 30).min(255) as u8,
+                        (bar_color[1] as u16 + 30).min(255) as u8,
+                        (bar_color[2] as u16 + 30).min(255) as u8,
+                        255
+                    ]);
+                    let cap_rect = Rect::at(x, y).of_size(bw, cap_height as u32);
+                    draw_filled_rect_mut(&mut image, cap_rect, cap_color);
+                }
             }
         }
     }
