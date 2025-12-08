@@ -289,10 +289,10 @@ fn run_gpu_export_impl(
             2.0 + rng.gen::<f32>() * 3.0
         };
 
-        // CRITICAL: Start with low alpha like preview (0.1)
-        // The shader will ramp this up based on audio
+        // Start with HIGHER alpha for better initial visibility
+        // Preview's particles ramp up quickly, so we start with moderate alpha
         let initial_alpha = if config.particles.audio_reactive_spawn {
-            0.1 // Matches preview's spawn_audio_particle
+            0.5 // Higher initial alpha for better visibility
         } else {
             1.0 // Non-reactive mode: fully visible
         };
@@ -305,8 +305,8 @@ fn run_gpu_export_impl(
             life: initial_life,
             max_life: 5.0, // Matches preview's max_life
             audio_alpha: initial_alpha,
-            audio_size: 0.5,
-            brightness: 1.0,
+            audio_size: 1.0,  // Full size from start for better visibility
+            brightness: 1.2,  // Slightly boosted brightness
             _padding: [0.0; 2],
         });
     }
@@ -447,13 +447,13 @@ fn run_gpu_export_impl(
             _padding: [0.0; 2],
         };
 
-        // Render Params - matched to preview quality exactly
+        // Render Params - BOOSTED for better visibility to match preview quality
         let render_params = RenderParams {
             width: width as f32,
             height: height as f32,
-            glow_intensity: config.particles.glow_intensity, // Use exact config value - shader handles volumetric rendering
-            exposure: 1.0,
-            bloom_strength: config.visual.bloom_intensity,
+            glow_intensity: config.particles.glow_intensity.max(0.5), // Minimum glow for visibility
+            exposure: 1.2,  // Boosted exposure for brighter output
+            bloom_strength: config.visual.bloom_intensity.max(0.3) * 1.5, // Enhanced bloom
             shape_id: match config.particles.shape {
                 crate::config::ParticleShape::Circle => 0.0,
                 crate::config::ParticleShape::Diamond => 1.0,
@@ -490,6 +490,9 @@ fn run_gpu_export_impl(
         // Render and upload overlay
         let overlay_pixels = render_overlay_cpu(width, height, &audio_state, &config);
         renderer.upload_overlay(&overlay_pixels);
+
+        // Run bloom pass for glow effect (must be done before tonemap)
+        renderer.run_bloom();
 
         renderer.tonemap(&render_params);
 
