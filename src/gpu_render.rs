@@ -4,7 +4,6 @@
 
 use bytemuck::{Pod, Zeroable};
 use std::sync::Arc;
-use wgpu::util::DeviceExt;
 
 /// GPU Particle data structure (matches WGSL layout)
 #[repr(C)]
