@@ -420,13 +420,18 @@ impl GpuRenderer {
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba16Float,
+                    // Fixed: Use One for premultiplied alpha output from shader
                     blend: Some(wgpu::BlendState {
                         color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::SrcAlpha,
+                            src_factor: wgpu::BlendFactor::One,
                             dst_factor: wgpu::BlendFactor::One,
                             operation: wgpu::BlendOperation::Add,
                         },
-                        alpha: wgpu::BlendComponent::OVER,
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
                     }),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -1056,6 +1061,11 @@ var<private> QUAD_UVS: array<vec2<f32>, 6> = array<vec2<f32>, 6>(
 @group(0) @binding(0) var<storage, read> particles: array<Particle>;
 @group(0) @binding(1) var<uniform> params: RenderParams;
 
+// Convert sRGB to linear color space
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    return pow(c, vec3<f32>(2.2));
+}
+
 @vertex
 fn vs_main(
     @builtin(vertex_index) vertex_idx: u32,
@@ -1079,7 +1089,8 @@ fn vs_main(
     let quad_uv = QUAD_UVS[local_vertex_idx];
 
     // Scale by particle size with glow extension
-    let size = p.size * p.audio_size * (1.5 + params.glow_intensity);
+    let glow_mult = 1.5 + params.glow_intensity * 0.5;
+    let size = p.size * p.audio_size * glow_mult;
 
     // Convert to clip space
     let world_pos = p.position + quad_pos * size;
@@ -1091,7 +1102,10 @@ fn vs_main(
     // Compute alpha from life and audio
     let life_alpha = clamp(p.life / p.max_life, 0.0, 1.0);
     let alpha = life_alpha * p.audio_alpha * p.brightness;
-    output.color = vec4<f32>(p.color.rgb, alpha);
+
+    // Convert particle color from sRGB to linear for HDR rendering
+    let linear_color = srgb_to_linear(p.color.rgb);
+    output.color = vec4<f32>(linear_color, alpha);
     output.uv = quad_uv;
     output.glow = params.glow_intensity;
 
@@ -1100,45 +1114,53 @@ fn vs_main(
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    // Distance from center of quad
+    // Distance from center of quad (0.5, 0.5)
     let center = vec2<f32>(0.5, 0.5);
     let uv = input.uv;
     var dist = 0.0;
 
     // Shape selection
-    if (abs(params.shape_id - 1.0) < 0.1) {
+    let shape = i32(params.shape_id + 0.5);
+    if (shape == 1) {
         // Diamond
         dist = abs(uv.x - center.x) + abs(uv.y - center.y);
-        dist = dist * 2.0; // Normalize to roughly circle size
-    } else if (abs(params.shape_id - 2.0) < 0.1) {
-        // Star (Approx 4-point)
-        let d1 = abs(uv.x - center.x) * 4.0; // Thin horizontal
-        let d2 = abs(uv.y - center.y) * 4.0; // Thin vertical
-        // Combine soft cross
-        dist = min(d1, d2) + length(uv - center) * 0.5;
+        dist = dist * 2.0;
+    } else if (shape == 2) {
+        // Star (4-point)
+        let d1 = abs(uv.x - center.x) * 3.0;
+        let d2 = abs(uv.y - center.y) * 3.0;
+        dist = min(d1, d2) + length(uv - center) * 0.3;
     } else {
         // Circle (Default)
         dist = length(uv - center) * 2.0;
     }
 
-    // Gaussian falloff for soft glow effect
-    let gaussian = exp(-3.0 * dist * dist);
+    // Multi-layer glow effect similar to egui preview
+    // Layer 1: Core (bright center)
+    let core_intensity = smoothstep(0.6, 0.0, dist);
 
-    // Core brightness (sharper center)
-    let core = smoothstep(1.0, 0.0, dist);
+    // Layer 2: Inner glow
+    let inner_glow = exp(-4.0 * dist * dist);
 
-    // Combine glow and core
-    let intensity = mix(core, gaussian, input.glow * 0.5) * gaussian;
+    // Layer 3: Outer glow (softer, wider)
+    let outer_glow = exp(-1.5 * dist * dist) * input.glow;
 
-    let color = input.color.rgb * intensity;
-    let alpha = input.color.a * intensity;
+    // Combine layers
+    let intensity = core_intensity * 0.7 + inner_glow * 0.5 + outer_glow * 0.3;
+
+    // Boost color brightness for visible particles
+    let boosted_color = input.color.rgb * (1.0 + input.glow * 0.5);
+
+    let final_color = boosted_color * intensity;
+    let final_alpha = input.color.a * intensity;
 
     // Skip nearly invisible fragments
-    if (alpha < 0.001) {
+    if (final_alpha < 0.002) {
         discard;
     }
 
-    return vec4<f32>(color * alpha, alpha);
+    // Output premultiplied alpha (color already multiplied by alpha)
+    return vec4<f32>(final_color * final_alpha, final_alpha);
 }
 "#;
 
@@ -1248,36 +1270,35 @@ fn vs_main(@builtin(vertex_index) vertex_idx: u32) -> VertexOutput {
     return output;
 }
 
-// ACES filmic tone mapping
-fn aces_tonemap(color: vec3<f32>) -> vec3<f32> {
-    let a = 2.51;
-    let b = 0.03;
-    let c = 2.43;
-    let d = 0.59;
-    let e = 0.14;
-    return clamp((color * (a * color + b)) / (color * (c * color + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+// Soft tone mapping - preserves colors better than ACES for particle rendering
+fn soft_tonemap(color: vec3<f32>) -> vec3<f32> {
+    // Reinhard with luminance preservation
+    let luminance = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let mapped_lum = luminance / (1.0 + luminance);
+    let scale = select(mapped_lum / luminance, 1.0, luminance < 0.0001);
+    return clamp(color * scale, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let hdr_color = textureSample(hdr_texture, tex_sampler, input.uv).rgb;
-    let bloom_color = textureSample(bloom_texture, tex_sampler, input.uv).rgb;
+    var hdr_color = textureSample(hdr_texture, tex_sampler, input.uv).rgb;
 
-    // Combine HDR and bloom
-    var color = hdr_color + bloom_color * params.bloom_strength;
+    // Apply exposure (use lower exposure to prevent washout)
+    let exposure_mult = pow(2.0, params.exposure - 1.0);
+    hdr_color = hdr_color * exposure_mult;
 
-    // Apply exposure
-    color = color * pow(2.0, params.exposure);
+    // Soft tone mapping (preserves colors better)
+    var color = soft_tonemap(hdr_color);
 
-    // Tone map
-    color = aces_tonemap(color);
+    // NOTE: Output format is Rgba8UnormSrgb which automatically applies
+    // sRGB gamma encoding, so we do NOT apply manual gamma correction here.
 
-    // Gamma correction (sRGB)
-    color = pow(color, vec3<f32>(1.0 / 2.2));
-
-    // Composite overlay
+    // Composite overlay on top (waveform, spectrum, etc.)
     let overlay = textureSample(overlay_texture, tex_sampler, input.uv);
-    color = mix(color, overlay.rgb, overlay.a);
+
+    // Proper alpha blending for overlay
+    let overlay_alpha = overlay.a;
+    color = color * (1.0 - overlay_alpha) + overlay.rgb;
 
     return vec4<f32>(color, 1.0);
 }
