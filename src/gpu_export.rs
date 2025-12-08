@@ -5,16 +5,14 @@
 use crate::audio::{AudioAnalysis, AudioState};
 use crate::config::AppConfig;
 use crate::gpu_render::{GpuRenderer, GpuParticle, RenderParams, SimParams};
-use crate::particles::ParticleEngine;
 use crossbeam_channel::{bounded, Sender, Receiver};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio, Child};
 use std::sync::mpsc::Sender as MpscSender;
 use std::thread;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use image::{ImageBuffer, Rgba};
-use imageproc::drawing::{draw_line_segment_mut, draw_filled_rect_mut};
+use imageproc::drawing::draw_filled_rect_mut;
 use imageproc::rect::Rect;
 
 /// Export progress message
@@ -326,29 +324,34 @@ fn run_gpu_export_impl(
     let progress_tx_clone = progress_tx.clone();
     let ffmpeg_handle = thread::spawn(move || -> Result<(), String> {
         let mut ffmpeg = ffmpeg;
-        let stdin = ffmpeg.stdin.as_mut().ok_or("Failed to open FFmpeg stdin")?;
 
         let mut last_progress_frame = 0;
         let progress_interval = 15;
 
-        for frame in frame_rx {
-            // Write frame to FFmpeg
-            stdin.write_all(&frame.pixels)
-                .map_err(|e| format!("FFmpeg write error: {}", e))?;
+        // Process frames - use scope to ensure stdin borrow ends before take()
+        {
+            let stdin = ffmpeg.stdin.as_mut().ok_or("Failed to open FFmpeg stdin")?;
 
-            // Send progress updates (from writer thread for accurate encoding progress)
-            if frame.frame_index - last_progress_frame >= progress_interval {
-                let _ = progress_tx_clone.send(GpuExportMessage::Progress {
-                    current: frame.frame_index,
-                    total: total_frames,
-                    fps: 0.0, // Will be calculated from elapsed time
-                });
-                last_progress_frame = frame.frame_index;
+            for frame in frame_rx {
+                // Write frame to FFmpeg
+                stdin.write_all(&frame.pixels)
+                    .map_err(|e| format!("FFmpeg write error: {}", e))?;
+
+                // Send progress updates (from writer thread for accurate encoding progress)
+                if frame.frame_index - last_progress_frame >= progress_interval {
+                    let _ = progress_tx_clone.send(GpuExportMessage::Progress {
+                        current: frame.frame_index,
+                        total: total_frames,
+                        fps: 0.0, // Will be calculated from elapsed time
+                    });
+                    last_progress_frame = frame.frame_index;
+                }
             }
         }
 
-        // Close stdin to signal EOF
-        drop(stdin);
+        // CRITICAL FIX: Take ownership of stdin and drop it to signal EOF to FFmpeg
+        // Previously used drop(stdin) which dropped a reference - did nothing!
+        drop(ffmpeg.stdin.take());
 
         // Wait for FFmpeg to finish with timeout
         let wait_start = std::time::Instant::now();
