@@ -238,7 +238,7 @@ fn run_gpu_export_impl(
     let mut renderer = GpuRenderer::new(width, height, config.particles.count as u32)
         .map_err(|e| format!("Failed to init GPU renderer: {}", e))?;
 
-    // 2. Generate Initial Particles - matching preview quality
+    // 2. Generate Initial Particles - matching preview quality with audio-reactive initialization
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let mut gpu_particles = Vec::with_capacity(config.particles.count);
@@ -248,47 +248,18 @@ fn run_gpu_export_impl(
     // Preview uses draw_volumetric_particle with multiple layers creating larger visual effect
     let size_boost = 2.5;
 
-    for _i in 0..config.particles.count {
-        let (pos, vel) = match config.particles.mode {
-            crate::config::ParticleMode::Orbit => {
-                let angle = rng.gen_range(0.0..std::f32::consts::TAU);
-                let radius = rng.gen_range(50.0..300.0);
-                let cx = width as f32 / 2.0;
-                let cy = height as f32 / 2.0;
-                (
-                    [cx + angle.cos() * radius, cy + angle.sin() * radius],
-                    [angle.sin() * 2.0, -angle.cos() * 2.0]
-                )
-            },
-            crate::config::ParticleMode::Cinematic => {
-                let angle = rng.gen_range(0.0..std::f32::consts::TAU);
-                let radius = rng.gen_range(100.0..500.0);
-                let cx = width as f32 / 2.0;
-                let cy = height as f32 / 2.0;
-                (
-                    [cx + angle.cos() * radius, cy + angle.sin() * radius],
-                    [rng.gen_range(-0.5..0.5), rng.gen_range(-0.5..0.5)]
-                )
-            },
-            _ => {
-                // For Chaos and other modes, spawn from center if configured
-                if config.particles.spawn_from_center {
-                    let angle = rng.gen_range(0.0..std::f32::consts::TAU);
-                    let radius = rng.gen_range(10.0..config.particles.spawn_radius);
-                    let cx = width as f32 / 2.0;
-                    let cy = height as f32 / 2.0;
-                    (
-                        [cx + angle.cos() * radius, cy + angle.sin() * radius],
-                        [angle.cos() * rng.gen_range(0.2..0.8), angle.sin() * rng.gen_range(0.2..0.8)]
-                    )
-                } else {
-                    (
-                        [rng.gen_range(0.0..width as f32), rng.gen_range(0.0..height as f32)],
-                        [rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0)]
-                    )
-                }
-            }
-        };
+    let cx = width as f32 / 2.0;
+    let cy = height as f32 / 2.0;
+
+    for i in 0..config.particles.count {
+        // Initial position - spawn from center area like preview's spawn_audio_particle
+        let angle = rng.gen_range(0.0..std::f32::consts::TAU);
+        let radius = rng.gen_range(10.0..config.particles.spawn_radius);
+        let pos = [cx + angle.cos() * radius, cy + angle.sin() * radius];
+
+        // Small initial velocity, outward from center
+        let speed = 0.1 + rng.gen::<f32>() * 0.2;
+        let vel = [angle.cos() * speed, angle.sin() * speed];
 
         // Assign random color from scheme
         let color_idx = rng.gen_range(0..colors.particles.len());
@@ -305,15 +276,34 @@ fn run_gpu_export_impl(
         let size_var = 1.0 + (rng.gen::<f32>() - 0.5) * config.particles.size_variation;
         let final_size = base_size * size_var * size_boost;
 
+        // CRITICAL: Match preview's particle lifecycle
+        // Preview uses life: 2-5 seconds, audio_alpha: 0.1 (starts low, ramps up)
+        // Stagger initial life so particles don't all die at once
+        let initial_life = if config.particles.audio_reactive_spawn {
+            // For audio-reactive mode: short life like preview, staggered
+            0.5 + rng.gen::<f32>() * 2.0 + (i as f32 / config.particles.count as f32) * 2.0
+        } else {
+            // For non-reactive mode: longer life
+            2.0 + rng.gen::<f32>() * 3.0
+        };
+
+        // CRITICAL: Start with low alpha like preview (0.1)
+        // The shader will ramp this up based on audio
+        let initial_alpha = if config.particles.audio_reactive_spawn {
+            0.1 // Matches preview's spawn_audio_particle
+        } else {
+            1.0 // Non-reactive mode: fully visible
+        };
+
         gpu_particles.push(GpuParticle {
             position: pos,
             velocity: vel,
             color: color_val,
             size: final_size,
-            life: 50.0 + rng.gen::<f32>() * 100.0,
-            max_life: 150.0,
-            audio_alpha: 1.0,
-            audio_size: 1.0,
+            life: initial_life,
+            max_life: 5.0, // Matches preview's max_life
+            audio_alpha: initial_alpha,
+            audio_size: 0.5,
             brightness: 1.0,
             _padding: [0.0; 2],
         });
@@ -341,22 +331,53 @@ fn run_gpu_export_impl(
             audio_state.update_from_frame(&frame, config.audio.smoothing);
         }
 
+        // Apply adaptive audio normalization if enabled (matching preview behavior)
+        let (normalized_amplitude, normalized_bass, normalized_mid, normalized_high) =
+            if config.particles.adaptive_audio_enabled {
+                // Simple adaptive normalization: boost quiet sections, compress loud sections
+                // This matches the preview's NormalizedAudio behavior
+                let base_amp = audio_state.amplitude;
+                let adaptive = config.particles.adaptive_strength;
+
+                // Apply frequency-weighted sensitivity (matching preview)
+                let bass = (audio_state.bass * config.particles.bass_sensitivity).min(1.5);
+                let mid = (audio_state.mid * config.particles.mid_sensitivity).min(1.5);
+                let high = (audio_state.high * config.particles.high_sensitivity).min(1.5);
+
+                // Compute weighted intensity
+                let intensity = (bass * 0.4 + mid * 0.35 + high * 0.25).clamp(0.0, 1.5);
+
+                // Blend between raw and normalized based on adaptive_strength
+                let final_amp = base_amp * (1.0 - adaptive * 0.5) + intensity * adaptive * 0.5;
+
+                (final_amp.clamp(0.0, 1.5), bass, mid, high)
+            } else {
+                (audio_state.amplitude, audio_state.bass, audio_state.mid, audio_state.high)
+            };
+
         // Sim Params - use actual config values for proper physics matching preview
         let sim_params = SimParams {
             delta_time: dt,
             time,
             width: width as f32,
             height: height as f32,
-            audio_amplitude: audio_state.amplitude,
-            audio_bass: audio_state.bass,
-            audio_mid: audio_state.mid,
-            audio_high: audio_state.high,
+            audio_amplitude: normalized_amplitude,
+            audio_bass: normalized_bass,
+            audio_mid: normalized_mid,
+            audio_high: normalized_high,
             audio_beat: audio_state.beat,
             beat_burst_strength: config.particles.beat_burst_strength,
             damping: config.particles.damping,
             speed: config.particles.speed,
             num_particles: config.particles.count as u32,
             has_audio: 1,
+            // Audio-reactive parameters matching preview
+            fade_attack_speed: config.particles.fade_attack_speed,
+            fade_release_speed: config.particles.fade_release_speed,
+            audio_spawn_threshold: config.particles.audio_spawn_threshold,
+            audio_reactive_spawn: if config.particles.audio_reactive_spawn { 1 } else { 0 },
+            spawn_radius: config.particles.spawn_radius,
+            gravity: config.particles.gravity,
             _padding: [0.0; 2],
         };
 

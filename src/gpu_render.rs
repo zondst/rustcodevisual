@@ -40,6 +40,13 @@ pub struct SimParams {
     pub speed: f32,
     pub num_particles: u32,
     pub has_audio: u32,
+    // Audio-reactive parameters (matching preview behavior)
+    pub fade_attack_speed: f32,
+    pub fade_release_speed: f32,
+    pub audio_spawn_threshold: f32,
+    pub audio_reactive_spawn: u32,
+    pub spawn_radius: f32,
+    pub gravity: f32,
     pub _padding: [f32; 2],
 }
 
@@ -920,6 +927,13 @@ struct SimParams {
     speed: f32,
     num_particles: u32,
     has_audio: u32,
+    // Audio-reactive parameters (matching preview behavior)
+    fade_attack_speed: f32,
+    fade_release_speed: f32,
+    audio_spawn_threshold: f32,
+    audio_reactive_spawn: u32,
+    spawn_radius: f32,
+    gravity: f32,
     _padding: vec2<f32>,
 }
 
@@ -928,6 +942,13 @@ struct SimParams {
 @group(0) @binding(2) var<uniform> params: SimParams;
 @group(0) @binding(3) var<storage, read> spectrum: array<f32, 64>;
 
+// Simple pseudo-random function
+fn rand(seed: u32) -> f32 {
+    let s = seed * 747796405u + 2891336453u;
+    let word = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return f32((word >> 22u) ^ word) / 4294967295.0;
+}
+
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
@@ -935,22 +956,53 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     var p = particles_in[idx];
 
-    // Skip dead particles
-    if (p.life <= 0.0 || p.audio_alpha < 0.01) {
-        particles_out[idx] = p;
-        return;
-    }
-
     let center = vec2<f32>(params.width / 2.0, params.height / 2.0);
     let dt = params.delta_time;
 
-    // Audio-reactive forces
-    let has_audio = params.has_audio > 0u;
+    // Audio-reactive mode detection (matching preview logic)
+    let audio_reactive = params.audio_reactive_spawn > 0u;
+    let has_audio = params.has_audio > 0u && params.audio_amplitude > params.audio_spawn_threshold;
     let audio_level = params.audio_amplitude;
     let is_beat = params.audio_beat > 0.5;
+    let is_strong_beat = params.audio_beat > 0.7;
 
-    // Beat burst - particles explode outward on beat
-    if (is_beat && params.beat_burst_strength > 0.0) {
+    // Check if particle should respawn (dead or fully faded)
+    let should_respawn = p.life <= 0.0 || (audio_reactive && p.audio_alpha < 0.01);
+
+    if (should_respawn) {
+        // Only respawn if there's audio (audio-reactive mode) or always (non-reactive)
+        if (!audio_reactive || has_audio) {
+            // Respawn particle from center (matching preview's spawn_audio_particle)
+            let seed = idx + u32(params.time * 1000.0);
+            let angle = rand(seed) * 6.28318530718;
+            let radius = rand(seed + 1u) * params.spawn_radius + 10.0;
+
+            p.position = vec2<f32>(
+                center.x + cos(angle) * radius,
+                center.y + sin(angle) * radius
+            );
+
+            // Initial velocity: outward from center, scaled by audio
+            let speed_mult = audio_level * 0.5 + 0.1;
+            p.velocity = vec2<f32>(cos(angle) * speed_mult, sin(angle) * speed_mult);
+
+            // Lifetime matching preview: 2-5 seconds
+            p.life = 2.0 + rand(seed + 2u) * 3.0;
+            p.max_life = 5.0;
+
+            // Start with low alpha like preview (ramps up with audio)
+            p.audio_alpha = 0.1;
+            p.audio_size = clamp(audio_level, 0.3, 1.0);
+            p.brightness = 1.0;
+        } else {
+            // No audio in reactive mode - keep particle dead
+            particles_out[idx] = p;
+            return;
+        }
+    }
+
+    // Beat burst - particles explode outward on strong beat (matching preview)
+    if (is_strong_beat && params.beat_burst_strength > 0.0) {
         let dir = p.position - center;
         let dist = max(length(dir), 1.0);
         let normalized_dir = dir / dist;
@@ -970,10 +1022,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let flow_y = cos(nx * 6.0) + sin(ny * 3.0) * 0.5;
     p.velocity += vec2<f32>(flow_x, flow_y) * 0.02 * (1.0 + params.audio_mid);
 
+    // Apply gravity (matching preview)
+    p.velocity.y += params.gravity * params.speed * 60.0 * dt * 0.5;
+
     // Physics integration
     p.position += p.velocity * params.speed * 60.0 * dt;
 
-    // Damping
+    // Damping (exponential, matching preview)
     let damping_factor = exp(-params.damping * dt);
     p.velocity *= damping_factor;
 
@@ -983,17 +1038,25 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         p.velocity = p.velocity * (5.0 / vel_mag);
     }
 
-    // Update audio-driven properties
-    if (has_audio) {
-        p.audio_size = clamp(audio_level, 0.3, 1.5);
-        let target_alpha = clamp(audio_level, 0.4, 1.0);
-        let fade_speed = select(2.0, 8.0, target_alpha > p.audio_alpha);
+    // Audio-driven opacity with asymmetric attack/release (matching preview exactly)
+    if (audio_reactive) {
+        // Target alpha based on audio level
+        let target_alpha = select(0.0, clamp(audio_level, 0.4, 1.0), has_audio);
+
+        // Asymmetric fade: fast appear (attack), slow fade (release)
+        let fade_speed = select(params.fade_release_speed, params.fade_attack_speed, target_alpha > p.audio_alpha);
         p.audio_alpha += (target_alpha - p.audio_alpha) * fade_speed * dt;
-        p.brightness = 0.7 + audio_level * 0.2 + params.audio_beat * 0.1;
+        p.audio_alpha = clamp(p.audio_alpha, 0.0, 1.0);
+
+        // Size driven by audio amplitude
+        p.audio_size = clamp(audio_level, 0.3, 1.5);
     } else {
-        p.audio_alpha -= 2.0 * dt;
+        // Non-reactive mode: always visible
+        p.audio_alpha = 1.0;
     }
-    p.audio_alpha = clamp(p.audio_alpha, 0.0, 1.0);
+
+    // Brightness from audio (matching preview)
+    p.brightness = select(0.5, 0.7 + audio_level * 0.2 + params.audio_beat * 0.1, has_audio);
 
     // Life decay
     p.life -= dt;
