@@ -361,13 +361,13 @@ fn run_gpu_export_impl(
             _padding: [0.0; 2],
         };
         
-        // Render Params
+        // Render Params - exposure tuned to preserve colors
         let render_params = RenderParams {
             width: width as f32,
             height: height as f32,
             glow_intensity: config.particles.glow_intensity,
-            exposure: 1.2,
-            bloom_strength: config.visual.bloom_intensity,
+            exposure: 0.8, // Reduced to prevent color washout
+            bloom_strength: config.visual.bloom_intensity * 0.5, // Reduced bloom
             shape_id: match config.particles.shape {
                  crate::config::ParticleShape::Circle => 0.0,
                  crate::config::ParticleShape::Diamond => 1.0,
@@ -460,62 +460,187 @@ pub fn get_gpu_info() -> Option<String> {
     })
 }
 
+/// Draw an anti-aliased line with glow effect
+fn draw_line_with_glow(
+    image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
+    start: (f32, f32),
+    end: (f32, f32),
+    color: [u8; 3],
+    thickness: f32,
+    glow_alpha: u8,
+) {
+    // Draw outer glow first (wider, more transparent)
+    let glow_color = Rgba([color[0], color[1], color[2], glow_alpha / 3]);
+    draw_antialiased_line_with_thickness(image, start, end, glow_color, thickness * 3.0);
+
+    // Draw mid glow
+    let mid_glow_color = Rgba([color[0], color[1], color[2], glow_alpha / 2]);
+    draw_antialiased_line_with_thickness(image, start, end, mid_glow_color, thickness * 2.0);
+
+    // Draw main line
+    let main_color = Rgba([color[0], color[1], color[2], 255]);
+    draw_antialiased_line_with_thickness(image, start, end, main_color, thickness);
+}
+
+/// Draw an anti-aliased line with specified thickness (Bresenham with alpha blending)
+fn draw_antialiased_line_with_thickness(
+    image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
+    start: (f32, f32),
+    end: (f32, f32),
+    color: Rgba<u8>,
+    thickness: f32,
+) {
+    let (x0, y0) = start;
+    let (x1, y1) = end;
+    let width = image.width() as i32;
+    let height = image.height() as i32;
+
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let length = (dx * dx + dy * dy).sqrt();
+
+    if length < 0.5 {
+        return;
+    }
+
+    // Perpendicular direction for thickness
+    let nx = -dy / length;
+    let ny = dx / length;
+
+    // Number of steps along the line
+    let steps = (length * 2.0) as i32;
+    let half_thick = thickness / 2.0;
+
+    for step in 0..=steps {
+        let t = step as f32 / steps as f32;
+        let cx = x0 + dx * t;
+        let cy = y0 + dy * t;
+
+        // Draw pixels perpendicular to line
+        let thick_steps = (thickness * 2.0) as i32;
+        for ts in -thick_steps..=thick_steps {
+            let offset = ts as f32 / 2.0;
+            let px = (cx + nx * offset) as i32;
+            let py = (cy + ny * offset) as i32;
+
+            if px >= 0 && px < width && py >= 0 && py < height {
+                let dist_from_center = offset.abs();
+                let alpha_mult = if dist_from_center < half_thick {
+                    1.0
+                } else {
+                    (1.0 - (dist_from_center - half_thick) / half_thick).max(0.0)
+                };
+
+                let pixel = image.get_pixel_mut(px as u32, py as u32);
+                let src_alpha = (color[3] as f32 * alpha_mult) as u8;
+
+                // Alpha blending
+                let dst_alpha = pixel[3];
+                let out_alpha = src_alpha as u16 + dst_alpha as u16 * (255 - src_alpha) as u16 / 255;
+
+                if out_alpha > 0 {
+                    let blend = |s: u8, d: u8| -> u8 {
+                        let result = (s as u16 * src_alpha as u16 + d as u16 * dst_alpha as u16 * (255 - src_alpha) as u16 / 255) / out_alpha;
+                        result.min(255) as u8
+                    };
+
+                    pixel[0] = blend(color[0], pixel[0]);
+                    pixel[1] = blend(color[1], pixel[1]);
+                    pixel[2] = blend(color[2], pixel[2]);
+                    pixel[3] = out_alpha.min(255) as u8;
+                }
+            }
+        }
+    }
+}
+
+/// Draw a circle outline with optional glow
+fn draw_circle_outline(
+    image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
+    center: (f32, f32),
+    radius: f32,
+    color: [u8; 3],
+    alpha: u8,
+    thickness: f32,
+) {
+    let segments = (radius * 0.5).max(64.0) as usize;
+    let angle_step = std::f32::consts::TAU / segments as f32;
+
+    for i in 0..segments {
+        let angle1 = i as f32 * angle_step;
+        let angle2 = (i + 1) as f32 * angle_step;
+
+        let x1 = center.0 + angle1.cos() * radius;
+        let y1 = center.1 + angle1.sin() * radius;
+        let x2 = center.0 + angle2.cos() * radius;
+        let y2 = center.1 + angle2.sin() * radius;
+
+        let rgba = Rgba([color[0], color[1], color[2], alpha]);
+        draw_antialiased_line_with_thickness(image, (x1, y1), (x2, y2), rgba, thickness);
+    }
+}
+
 /// Software renderer for visual overlays (Waveform/Spectrum)
 fn render_overlay_cpu(width: u32, height: u32, audio: &AudioState, config: &AppConfig) -> Vec<u8> {
     let mut image = ImageBuffer::from_pixel(width, height, Rgba([0u8, 0, 0, 0]));
+    let colors = config.get_color_scheme();
 
     // Draw Waveform
     if config.waveform.enabled {
-        let color = Rgba([
-            config.get_color_scheme().waveform[0],
-            config.get_color_scheme().waveform[1],
-            config.get_color_scheme().waveform[2],
-            255,
-        ]);
+        let waveform_color = colors.waveform;
+        let thickness = config.waveform.thickness.max(2.0);
+        let glow_alpha = ((audio.amplitude * 150.0).min(200.0) + 55.0) as u8;
 
         match config.waveform.style {
             crate::config::WaveformStyle::Circle => {
-                 let center_x = width as f32 * config.waveform.position_x;
-                 let center_y = height as f32 * config.waveform.position_y;
-                 let base_radius = width.min(height) as f32 * config.waveform.circular_radius;
-                 let amplitude = config.waveform.amplitude * (1.0 + audio.amplitude * 0.5) * 0.5;
+                let center_x = width as f32 * config.waveform.position_x;
+                let center_y = height as f32 * config.waveform.position_y;
+                let base_radius = width.min(height) as f32 * config.waveform.circular_radius;
+                let amplitude = config.waveform.amplitude * (1.0 + audio.amplitude * 0.5) * 0.5;
 
-                 let samples = audio.waveform.len();
-                 let angle_step = std::f32::consts::TAU / samples as f32;
-                 
-                 let mut prev_x = 0.0;
-                 let mut prev_y = 0.0;
+                // Draw inner reference circle (like preview)
+                let inner_radius = base_radius * 0.8;
+                draw_circle_outline(
+                    &mut image,
+                    (center_x, center_y),
+                    inner_radius,
+                    waveform_color,
+                    50,
+                    1.0,
+                );
 
-                 for (i, &value) in audio.waveform.iter().enumerate() {
-                     let angle = i as f32 * angle_step - std::f32::consts::FRAC_PI_2;
-                     let radius = base_radius + value * amplitude;
-                     let x = center_x + angle.cos() * radius;
-                     let y = center_y + angle.sin() * radius;
+                // Draw waveform circle with glow
+                let samples = audio.waveform.len();
+                let angle_step = std::f32::consts::TAU / samples as f32;
 
-                     if i > 0 {
-                        draw_line_segment_mut(&mut image, (prev_x, prev_y), (x, y), color);
-                        // Simple glow - draw thicker slightly transparent line
-                        // (Not strictly possible with basic imageproc without blending, keeping it simple for now or strictly matching line)
-                        // To make it look "better", we could draw a second thick line behind if we had alpha blending, 
-                        // but imageproc's draw_line overwrites.
-                     }
-                     prev_x = x;
-                     prev_y = y;
-                     
-                     // Close the loop
-                     if i == samples - 1 {
-                         let angle0 = -std::f32::consts::FRAC_PI_2;
-                         let radius0 = base_radius + audio.waveform[0] * amplitude;
-                         let x0 = center_x + angle0.cos() * radius0;
-                         let y0 = center_y + angle0.sin() * radius0;
-                         draw_line_segment_mut(&mut image, (x, y), (x0, y0), color);
-                     }
-                 }
+                let mut prev_x = 0.0;
+                let mut prev_y = 0.0;
+                let mut first_x = 0.0;
+                let mut first_y = 0.0;
+
+                for (i, &value) in audio.waveform.iter().enumerate() {
+                    let angle = i as f32 * angle_step - std::f32::consts::FRAC_PI_2;
+                    let radius = base_radius + value * amplitude;
+                    let x = center_x + angle.cos() * radius;
+                    let y = center_y + angle.sin() * radius;
+
+                    if i == 0 {
+                        first_x = x;
+                        first_y = y;
+                    } else {
+                        draw_line_with_glow(&mut image, (prev_x, prev_y), (x, y), waveform_color, thickness, glow_alpha);
+                    }
+                    prev_x = x;
+                    prev_y = y;
+                }
+
+                // Close the loop
+                draw_line_with_glow(&mut image, (prev_x, prev_y), (first_x, first_y), waveform_color, thickness, glow_alpha);
             },
             crate::config::WaveformStyle::Mirror => {
                 let center_y = height as f32 * config.waveform.position_y;
                 let amplitude = config.waveform.amplitude * (1.0 + audio.amplitude * 0.5);
-                
+
                 let mut prev_x = 0.0;
                 let mut prev_upper_y = center_y;
                 let mut prev_lower_y = center_y;
@@ -527,27 +652,32 @@ fn render_overlay_cpu(width: u32, height: u32, audio: &AudioState, config: &AppC
                     let lower_y = center_y + offset;
 
                     if i > 0 {
-                        draw_line_segment_mut(&mut image, (prev_x, prev_upper_y), (x, upper_y), color);
-                        draw_line_segment_mut(&mut image, (prev_x, prev_lower_y), (x, lower_y), color);
+                        draw_line_with_glow(&mut image, (prev_x, prev_upper_y), (x, upper_y), waveform_color, thickness, glow_alpha);
+                        draw_line_with_glow(&mut image, (prev_x, prev_lower_y), (x, lower_y), waveform_color, thickness, glow_alpha);
                     }
                     prev_x = x;
                     prev_upper_y = upper_y;
                     prev_lower_y = lower_y;
                 }
+
+                // Draw center line
+                let center_color = Rgba([waveform_color[0], waveform_color[1], waveform_color[2], 100]);
+                draw_antialiased_line_with_thickness(&mut image, (0.0, center_y), (width as f32, center_y), center_color, 1.0);
             },
-            _ => { // Line and others fallback
+            _ => {
+                // Line style
                 let center_y = height as f32 * config.waveform.position_y;
                 let amplitude = config.waveform.amplitude * (1.0 + audio.amplitude * 0.5);
-                
+
                 let mut prev_x = 0.0;
                 let mut prev_y = center_y;
-                
+
                 for (i, &sample) in audio.waveform.iter().enumerate() {
                     let x = (i as f32 / audio.waveform.len() as f32) * width as f32;
                     let y = center_y - sample * amplitude;
-                    
+
                     if i > 0 {
-                        draw_line_segment_mut(&mut image, (prev_x, prev_y), (x, y), color);
+                        draw_line_with_glow(&mut image, (prev_x, prev_y), (x, y), waveform_color, thickness, glow_alpha);
                     }
                     prev_x = x;
                     prev_y = y;
@@ -556,34 +686,47 @@ fn render_overlay_cpu(width: u32, height: u32, audio: &AudioState, config: &AppC
         }
     }
 
-    // Draw Spectrum bars
+    // Draw Spectrum bars with gradient and glow
     if config.spectrum.enabled {
         let bar_count = config.spectrum.bar_count.min(audio.spectrum.len());
-        let bar_width = (width as f32 / bar_count as f32) * 0.8;
-        let spacing = (width as f32 / bar_count as f32) * 0.2;
-        let color = Rgba([
-            config.get_color_scheme().spectrum_low[0],
-            config.get_color_scheme().spectrum_low[1],
-            config.get_color_scheme().spectrum_low[2],
-            255,
-        ]);
+        let total_bar_width = width as f32 / bar_count as f32;
+        let bar_width = total_bar_width * config.spectrum.bar_width;
+        let bar_spacing = total_bar_width * config.spectrum.bar_spacing / 2.0;
+
+        let color_low = colors.spectrum_low;
+        let color_high = colors.spectrum_high;
 
         for i in 0..bar_count {
-            let val = audio.spectrum[i];
-            let bar_height = val * config.spectrum.bar_height_scale * height as f32 * 0.5;
-            
-            let x = i as f32 * (bar_width + spacing);
-            let y = height as f32 - bar_height;
-            
+            let spectrum_idx = i * audio.spectrum.len() / bar_count;
+            let val = audio.spectrum.get(spectrum_idx).copied().unwrap_or(0.0);
+            let boosted_val = (val * (1.0 + audio.beat * 0.5)).min(1.0);
+            let bar_height = boosted_val * config.spectrum.bar_height_scale * height as f32 * 0.5;
+
+            let x = (i as f32 * total_bar_width + bar_spacing) as i32;
+            let y = (height as f32 - bar_height) as i32;
+
             let bw = bar_width as u32;
             let bh = bar_height as u32;
 
+            // Gradient color based on frequency
+            let t = i as f32 / bar_count as f32;
+            let bar_color = [
+                ((1.0 - t) * color_low[0] as f32 + t * color_high[0] as f32) as u8,
+                ((1.0 - t) * color_low[1] as f32 + t * color_high[1] as f32) as u8,
+                ((1.0 - t) * color_low[2] as f32 + t * color_high[2] as f32) as u8,
+            ];
+
             if bw > 0 && bh > 0 {
-                draw_filled_rect_mut(
-                    &mut image,
-                    Rect::at(x as i32, y as i32).of_size(bw, bh),
-                    color,
-                );
+                // Draw glow (larger, semi-transparent)
+                let glow_color = Rgba([bar_color[0], bar_color[1], bar_color[2], (boosted_val * 100.0) as u8]);
+                let glow_rect = Rect::at((x - 2).max(0), (y - 4).max(0))
+                    .of_size((bw + 4).min(width - x as u32), (bh + 8).min(height));
+                draw_filled_rect_mut(&mut image, glow_rect, glow_color);
+
+                // Draw main bar
+                let main_color = Rgba([bar_color[0], bar_color[1], bar_color[2], 255]);
+                let bar_rect = Rect::at(x, y).of_size(bw, bh);
+                draw_filled_rect_mut(&mut image, bar_rect, main_color);
             }
         }
     }
