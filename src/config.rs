@@ -246,19 +246,19 @@ impl Default for ParticleConfig {
             breathing_scale: 0.2,
             orbit_speed: 0.1,
             beat_size_pulse: 1.5,
-            glow_intensity: 0.6,
+            glow_intensity: 0.5,
             damping: 2.0,
             audio_reactive_spawn: true,
             audio_spawn_threshold: 0.02,
             fade_without_audio: true,
             volumetric_rendering: true,
-            volumetric_steps: 24,
+            volumetric_steps: 16,
             // Audio-physics defaults
             beat_burst_strength: 1.5,
             fade_attack_speed: 5.0,
             fade_release_speed: 2.0,
             spawn_from_center: true,
-            spawn_radius: 50.0,
+            spawn_radius: 80.0,
             // Adaptive audio defaults
             adaptive_audio_enabled: true,   // ON by default
             adaptive_window_secs: 3.0,
