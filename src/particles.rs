@@ -2,11 +2,12 @@
 //! Advanced particle system with physics, audio reactivity, and multiple modes
 
 use crate::audio::{AudioState, NormalizedAudio};
-use crate::config::{ColorScheme, ParticleConfig, ParticleMode, ParticleShape};
-use egui::{Color32, Painter, Pos2, Rect, Vec2};
+use crate::config::{ColorScheme, DeathSpiralConfig, ParticleConfig, ParticleMode, ParticleShape, TrailConfig, ConnectionConfig};
+use egui::{Color32, Painter, Pos2, Rect, Stroke, Vec2};
 use rand::Rng;
 use rayon::prelude::*;
 use std::f32::consts::PI;
+use std::collections::HashMap;
 
 /// Individual particle data
 #[derive(Clone)]
@@ -25,6 +26,9 @@ pub struct Particle {
     // Audio-driven state
     pub audio_alpha: f32, // Opacity driven by audio (0.0-1.0)
     pub audio_size: f32,  // Size multiplier from audio
+    // Death Spiral state
+    pub ring_index: usize,      // Which ring this particle belongs to
+    pub position_in_ring: f32,  // Position within the ring (0.0-1.0)
 }
 
 impl Default for Particle {
@@ -43,8 +47,163 @@ impl Default for Particle {
             brightness: 1.0,
             audio_alpha: 0.0,
             audio_size: 1.0,
+            ring_index: 0,
+            position_in_ring: 0.0,
         }
     }
+}
+
+/// Trail point for particle trail system
+#[derive(Clone, Copy)]
+pub struct TrailPoint {
+    pub pos: Vec2,
+    pub age: f32,      // 0.0 = new, 1.0 = fully faded
+    pub size: f32,
+    pub brightness: f32,
+    pub color: Color32,
+}
+
+/// Trail system for all particles
+pub struct TrailSystem {
+    /// Trail points for each particle (indexed by particle index)
+    pub trails: Vec<Vec<TrailPoint>>,
+    pub max_trail_length: usize,
+    pub trail_spawn_rate: f32,
+    pub trail_fade_speed: f32,
+    last_spawn_time: f32,
+}
+
+impl TrailSystem {
+    pub fn new(particle_count: usize, max_length: usize) -> Self {
+        Self {
+            trails: vec![Vec::with_capacity(max_length); particle_count],
+            max_trail_length: max_length,
+            trail_spawn_rate: 30.0,
+            trail_fade_speed: 2.0,
+            last_spawn_time: 0.0,
+        }
+    }
+
+    pub fn update(&mut self, particles: &[Particle], config: &TrailConfig, dt: f32) {
+        if !config.enabled || config.opacity < 0.01 {
+            // Clear trails if disabled
+            for trail in &mut self.trails {
+                trail.clear();
+            }
+            return;
+        }
+
+        self.trail_spawn_rate = config.spawn_rate;
+        self.trail_fade_speed = config.fade_speed;
+        self.max_trail_length = config.max_length;
+
+        self.last_spawn_time += dt;
+        let spawn_interval = 1.0 / self.trail_spawn_rate;
+        let should_spawn = self.last_spawn_time >= spawn_interval;
+
+        if should_spawn {
+            self.last_spawn_time = 0.0;
+        }
+
+        // Ensure we have enough trail vectors
+        if self.trails.len() < particles.len() {
+            self.trails.resize(particles.len(), Vec::with_capacity(self.max_trail_length));
+        }
+
+        for (i, particle) in particles.iter().enumerate() {
+            if i >= self.trails.len() {
+                continue;
+            }
+
+            let trail = &mut self.trails[i];
+
+            // Add new point if spawning and particle is visible
+            if should_spawn && particle.audio_alpha > 0.1 {
+                let point = TrailPoint {
+                    pos: particle.pos,
+                    age: 0.0,
+                    size: particle.size * config.width_scale,
+                    brightness: particle.brightness * config.opacity,
+                    color: particle.color,
+                };
+
+                if trail.len() >= self.max_trail_length {
+                    trail.remove(0);
+                }
+                trail.push(point);
+            }
+
+            // Update age and remove old points
+            trail.retain_mut(|point| {
+                point.age += dt * self.trail_fade_speed;
+                point.brightness *= 0.98;
+                point.age < 1.0
+            });
+        }
+    }
+
+    pub fn resize(&mut self, particle_count: usize) {
+        self.trails.resize(particle_count, Vec::with_capacity(self.max_trail_length));
+    }
+
+    pub fn render(&self, painter: &Painter, rect: Rect, config: &TrailConfig, _audio: &AudioState) {
+        if !config.enabled {
+            return;
+        }
+
+        for trail in &self.trails {
+            if trail.len() < 2 {
+                continue;
+            }
+
+            // Draw trail as connected line segments with fading
+            for i in 1..trail.len() {
+                let p0 = &trail[i - 1];
+                let p1 = &trail[i];
+
+                let alpha0 = ((1.0 - p0.age) * p0.brightness * 255.0 * config.opacity) as u8;
+                let alpha1 = ((1.0 - p1.age) * p1.brightness * 255.0 * config.opacity) as u8;
+
+                if alpha0 < 2 && alpha1 < 2 {
+                    continue;
+                }
+
+                let pos0 = rect.min + p0.pos;
+                let pos1 = rect.min + p1.pos;
+
+                // Use gradient between the two points
+                let avg_alpha = (alpha0 as u16 + alpha1 as u16) / 2;
+                let color = Color32::from_rgba_premultiplied(
+                    p0.color.r(),
+                    p0.color.g(),
+                    p0.color.b(),
+                    avg_alpha as u8,
+                );
+
+                let thickness = (p0.size + p1.size) / 2.0 * (1.0 - (p0.age + p1.age) / 2.0);
+                painter.line_segment([pos0, pos1], Stroke::new(thickness.max(0.5), color));
+
+                // Add glow effect if enabled
+                if config.glow_enabled && avg_alpha > 10 {
+                    let glow_alpha = (avg_alpha as f32 * 0.3) as u8;
+                    let glow_color = Color32::from_rgba_premultiplied(
+                        p0.color.r(),
+                        p0.color.g(),
+                        p0.color.b(),
+                        glow_alpha,
+                    );
+                    painter.line_segment([pos0, pos1], Stroke::new(thickness * 2.0, glow_color));
+                }
+            }
+        }
+    }
+}
+
+/// Connection between two particles
+pub struct Connection {
+    pub particle_a: usize,
+    pub particle_b: usize,
+    pub strength: f32,
 }
 
 /// Particle Engine managing all particles
@@ -59,6 +218,12 @@ pub struct ParticleEngine {
 
     // Palette cache
     palette: Vec<Color32>,
+
+    // Trail system
+    pub trail_system: TrailSystem,
+
+    // Death Spiral state
+    death_spiral_initialized: bool,
 }
 
 impl ParticleEngine {
@@ -70,6 +235,8 @@ impl ParticleEngine {
             time: 0.0,
             flow_field_time: 0.0,
             palette: vec![Color32::WHITE],
+            trail_system: TrailSystem::new(10000, 20),
+            death_spiral_initialized: false,
         }
     }
 
@@ -174,6 +341,7 @@ impl ParticleEngine {
             ParticleMode::Calm => self.update_calm(config, audio, dt, speed_factor),
             ParticleMode::Cinematic => self.update_cinematic(config, audio, dt, speed_factor),
             ParticleMode::Orbit => self.update_orbit(config, audio, dt, speed_factor),
+            ParticleMode::DeathSpiral => {} // Handled separately with spiral config
         }
 
         // ========================================================
@@ -461,6 +629,330 @@ impl ParticleEngine {
             // Moderate damping
             p.vel *= 0.97;
         });
+    }
+
+    /// Update particles in Death Spiral mode (ant mill / death dance effect)
+    /// Creates hypnotic concentric rings of particles following each other
+    pub fn update_death_spiral(
+        &mut self,
+        config: &ParticleConfig,
+        spiral_config: &DeathSpiralConfig,
+        audio: &AudioState,
+        dt: f32,
+        speed_factor: f32,
+    ) {
+        let center = Vec2::new(self.width / 2.0, self.height / 2.0);
+        let time = self.time;
+
+        // Initialize particles into rings if needed
+        if !self.death_spiral_initialized || self.particles.is_empty() {
+            self.initialize_death_spiral(config, spiral_config);
+            self.death_spiral_initialized = true;
+        }
+
+        // Audio-reactive parameters
+        let audio_speed_mult = 1.0 + audio.smooth_bass * spiral_config.audio_speed_influence;
+        let audio_radius_mult = 1.0 + audio.smooth_amplitude * spiral_config.audio_radius_influence;
+        let beat_pulse = 1.0 + audio.smooth_beat * spiral_config.beat_pulse_strength;
+
+        let ring_count = spiral_config.ring_count.max(1);
+        let particles_total = self.particles.len();
+        let particles_per_ring = particles_total / ring_count.max(1);
+
+        // Use indices for parallel iteration
+        let width = self.width;
+        let height = self.height;
+
+        self.particles.par_iter_mut().enumerate().for_each(|(idx, p)| {
+            // Determine ring and position in ring
+            let ring_idx = if particles_per_ring > 0 {
+                (idx / particles_per_ring).min(ring_count - 1)
+            } else {
+                0
+            };
+            let position_in_ring = if particles_per_ring > 0 {
+                (idx % particles_per_ring) as f32 / particles_per_ring.max(1) as f32
+            } else {
+                idx as f32 / particles_total.max(1) as f32
+            };
+
+            // Store ring info on particle
+            // Note: We can't modify these in parallel, so we use computed values
+
+            // Base radius for this ring (exponential spacing)
+            let base_radius = spiral_config.inner_radius
+                * spiral_config.ring_spacing.powf(ring_idx as f32)
+                * audio_radius_mult;
+
+            // Scale radius to fit screen
+            let max_radius = (width.min(height) / 2.0) * 0.85;
+            let scaled_radius = base_radius.min(max_radius);
+
+            // Direction: alternate for visual effect
+            let direction = if spiral_config.alternate_direction && ring_idx % 2 == 1 {
+                -1.0
+            } else {
+                1.0
+            };
+
+            // Speed: inner rings spin faster
+            let ring_speed = spiral_config.base_rotation_speed
+                * (1.0 + 0.3 * (ring_count - ring_idx) as f32)
+                * audio_speed_mult
+                * direction;
+
+            // Base angle + rotation from time
+            let base_angle = position_in_ring * PI * 2.0;
+            let rotated_angle = base_angle + time * ring_speed;
+
+            // Wave distortion for organic breathing effect
+            let wave_offset = (rotated_angle * spiral_config.wave_frequency + time * 2.0).sin()
+                * spiral_config.wave_amplitude
+                * scaled_radius;
+
+            // Spiral tightness (inward/outward spiral motion)
+            let spiral_offset = position_in_ring * spiral_config.spiral_tightness
+                * scaled_radius * 0.5;
+
+            // Final radius with beat pulse
+            let final_radius = (scaled_radius + wave_offset + spiral_offset) * beat_pulse;
+
+            // Target position
+            let target_x = center.x + rotated_angle.cos() * final_radius;
+            let target_y = center.y + rotated_angle.sin() * final_radius;
+            let target = Vec2::new(target_x, target_y);
+
+            // Follow behavior - particle moves toward target with inertia
+            let to_target = target - p.pos;
+            let follow_force = spiral_config.follow_strength * (1.0 + audio.smooth_mid * 0.5);
+
+            p.vel.x += to_target.x * follow_force * speed_factor;
+            p.vel.y += to_target.y * follow_force * speed_factor;
+
+            // Strong damping for smooth motion
+            p.vel *= 0.92;
+
+            // Clamp velocity to prevent chaos
+            let vel_mag = (p.vel.x * p.vel.x + p.vel.y * p.vel.y).sqrt();
+            let max_vel = 8.0 * audio_speed_mult;
+            if vel_mag > max_vel {
+                let scale = max_vel / vel_mag;
+                p.vel.x *= scale;
+                p.vel.y *= scale;
+            }
+
+            // Angular velocity synced with ring
+            p.angular_vel = ring_speed * 0.5;
+
+            // Size pulses with beat, outer rings slightly larger
+            let ring_size_mult = 1.0 + ring_idx as f32 * 0.1;
+            p.size = p.base_size * beat_pulse * ring_size_mult;
+
+            // Brightness based on audio
+            p.brightness = 0.7 + audio.smooth_amplitude * 0.3 + audio.smooth_beat * 0.2;
+
+            // Keep audio_alpha high for visibility
+            if p.audio_alpha < 0.8 {
+                p.audio_alpha += dt * 2.0;
+            }
+            p.audio_alpha = p.audio_alpha.min(1.0);
+        });
+    }
+
+    /// Initialize particles into death spiral formation
+    fn initialize_death_spiral(&mut self, config: &ParticleConfig, spiral_config: &DeathSpiralConfig) {
+        let center = Vec2::new(self.width / 2.0, self.height / 2.0);
+        let ring_count = spiral_config.ring_count.max(1);
+
+        // Ensure we have enough particles
+        let target_count = config.count.max(ring_count * spiral_config.particles_per_ring);
+
+        let mut rng = rand::thread_rng();
+
+        // Clear and respawn with ring assignments
+        self.particles.clear();
+
+        for ring_idx in 0..ring_count {
+            let particles_in_ring = if ring_idx < ring_count - 1 {
+                spiral_config.particles_per_ring
+            } else {
+                // Last ring gets remaining particles
+                target_count - self.particles.len()
+            };
+
+            let base_radius = spiral_config.inner_radius
+                * spiral_config.ring_spacing.powf(ring_idx as f32);
+
+            let max_radius = (self.width.min(self.height) / 2.0) * 0.85;
+            let scaled_radius = base_radius.min(max_radius);
+
+            for i in 0..particles_in_ring {
+                let position_in_ring = i as f32 / particles_in_ring as f32;
+                let angle = position_in_ring * PI * 2.0;
+
+                let pos = Vec2::new(
+                    center.x + angle.cos() * scaled_radius,
+                    center.y + angle.sin() * scaled_radius,
+                );
+
+                let color_idx = rng.gen_range(0..self.palette.len());
+                let base_size = config.min_size + rng.gen::<f32>() * (config.max_size - config.min_size);
+
+                let particle = Particle {
+                    pos,
+                    vel: Vec2::ZERO,
+                    life: 10.0, // Long life for death spiral
+                    max_life: 10.0,
+                    size: base_size,
+                    base_size,
+                    color: self.palette[color_idx],
+                    color_index: color_idx,
+                    angle: angle,
+                    angular_vel: 0.0,
+                    brightness: 1.0,
+                    audio_alpha: 1.0,
+                    audio_size: 1.0,
+                    ring_index: ring_idx,
+                    position_in_ring,
+                };
+
+                self.particles.push(particle);
+            }
+        }
+    }
+
+    /// Reset death spiral when mode changes
+    pub fn reset_death_spiral(&mut self) {
+        self.death_spiral_initialized = false;
+    }
+
+    /// Find connections between nearby particles using spatial hashing
+    pub fn find_connections(&self, config: &ConnectionConfig) -> Vec<Connection> {
+        if !config.enabled {
+            return Vec::new();
+        }
+
+        let mut connections = Vec::new();
+        let cell_size = config.max_distance;
+
+        // Spatial hashing for O(n) instead of O(n²)
+        let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+
+        for (i, p) in self.particles.iter().enumerate() {
+            if p.audio_alpha < 0.1 {
+                continue;
+            }
+            let cell_x = (p.pos.x / cell_size) as i32;
+            let cell_y = (p.pos.y / cell_size) as i32;
+            grid.entry((cell_x, cell_y)).or_default().push(i);
+        }
+
+        // Find neighbors
+        for (i, p) in self.particles.iter().enumerate() {
+            if p.audio_alpha < 0.1 {
+                continue;
+            }
+
+            let cell_x = (p.pos.x / cell_size) as i32;
+            let cell_y = (p.pos.y / cell_size) as i32;
+
+            let mut particle_connections = 0;
+
+            // Check neighboring cells
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    if let Some(neighbors) = grid.get(&(cell_x + dx, cell_y + dy)) {
+                        for &j in neighbors {
+                            if j <= i || particle_connections >= config.max_connections {
+                                continue;
+                            }
+
+                            let other = &self.particles[j];
+                            let dist_sq = (p.pos.x - other.pos.x).powi(2)
+                                + (p.pos.y - other.pos.y).powi(2);
+                            let max_dist_sq = config.max_distance.powi(2);
+
+                            if dist_sq < max_dist_sq {
+                                let strength = 1.0 - (dist_sq / max_dist_sq).sqrt();
+                                connections.push(Connection {
+                                    particle_a: i,
+                                    particle_b: j,
+                                    strength,
+                                });
+                                particle_connections += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        connections
+    }
+
+    /// Render connections between particles
+    pub fn render_connections(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        config: &ConnectionConfig,
+        audio: &AudioState,
+    ) {
+        if !config.enabled {
+            return;
+        }
+
+        let connections = self.find_connections(config);
+        let audio_mult = if config.audio_reactive {
+            1.0 + audio.smooth_beat * 0.5
+        } else {
+            1.0
+        };
+
+        for conn in connections {
+            if conn.particle_a >= self.particles.len() || conn.particle_b >= self.particles.len() {
+                continue;
+            }
+
+            let p_a = &self.particles[conn.particle_a];
+            let p_b = &self.particles[conn.particle_b];
+
+            let pos_a = rect.min + p_a.pos;
+            let pos_b = rect.min + p_b.pos;
+
+            let alpha = (conn.strength * config.opacity * audio_mult * 255.0) as u8;
+            if alpha < 2 {
+                continue;
+            }
+
+            // Gradient between particle colors
+            let color = if config.gradient_enabled {
+                let r = ((p_a.color.r() as u16 + p_b.color.r() as u16) / 2) as u8;
+                let g = ((p_a.color.g() as u16 + p_b.color.g() as u16) / 2) as u8;
+                let b = ((p_a.color.b() as u16 + p_b.color.b() as u16) / 2) as u8;
+                Color32::from_rgba_premultiplied(r, g, b, alpha)
+            } else {
+                Color32::from_rgba_premultiplied(
+                    p_a.color.r(),
+                    p_a.color.g(),
+                    p_a.color.b(),
+                    alpha,
+                )
+            };
+
+            let thickness = config.thickness * conn.strength * audio_mult;
+            painter.line_segment([pos_a, pos_b], Stroke::new(thickness.max(0.5), color));
+        }
+    }
+
+    /// Update trail system
+    pub fn update_trails(&mut self, config: &TrailConfig, dt: f32) {
+        self.trail_system.update(&self.particles, config, dt);
+    }
+
+    /// Render trails
+    pub fn render_trails(&self, painter: &Painter, rect: Rect, config: &TrailConfig, audio: &AudioState) {
+        self.trail_system.render(painter, rect, config, audio);
     }
 
     fn spawn_particle(&mut self, config: &ParticleConfig, rng: &mut rand::rngs::ThreadRng) {

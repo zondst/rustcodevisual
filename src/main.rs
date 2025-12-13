@@ -695,6 +695,17 @@ impl ParticleStudioApp {
                 "Cinematic",
             );
         });
+        ui.horizontal(|ui| {
+            let was_spiral = self.config.particles.mode == ParticleMode::DeathSpiral;
+            if ui.selectable_value(
+                &mut self.config.particles.mode,
+                ParticleMode::DeathSpiral,
+                "🐜 Death Spiral",
+            ).changed() && !was_spiral {
+                // Reset spiral when entering mode
+                self.particles.reset_death_spiral();
+            }
+        });
 
         ui.add_space(8.0);
         ui.label("Shape");
@@ -748,6 +759,165 @@ impl ParticleStudioApp {
                     }
                 }
             });
+
+        // Death Spiral Settings (only show when mode is active)
+        if self.config.particles.mode == ParticleMode::DeathSpiral {
+            ui.add_space(12.0);
+            ui.separator();
+            ui.heading("🐜 Death Spiral Settings");
+
+            ui.label("Ring Count");
+            if ui.add(egui::Slider::new(
+                &mut self.config.death_spiral.ring_count,
+                2..=10,
+            )).changed() {
+                self.particles.reset_death_spiral();
+            }
+
+            ui.label("Inner Radius");
+            ui.add(egui::Slider::new(
+                &mut self.config.death_spiral.inner_radius,
+                30.0..=200.0,
+            ));
+
+            ui.label("Ring Spacing");
+            ui.add(egui::Slider::new(
+                &mut self.config.death_spiral.ring_spacing,
+                1.1..=2.0,
+            ));
+
+            ui.label("Rotation Speed");
+            ui.add(egui::Slider::new(
+                &mut self.config.death_spiral.base_rotation_speed,
+                0.1..=2.0,
+            ));
+
+            ui.checkbox(
+                &mut self.config.death_spiral.alternate_direction,
+                "Alternate Direction",
+            );
+
+            ui.add_space(4.0);
+            ui.label("Audio Speed Influence");
+            ui.add(egui::Slider::new(
+                &mut self.config.death_spiral.audio_speed_influence,
+                0.0..=1.0,
+            ));
+
+            ui.label("Audio Radius Influence");
+            ui.add(egui::Slider::new(
+                &mut self.config.death_spiral.audio_radius_influence,
+                0.0..=1.0,
+            ));
+
+            ui.label("Beat Pulse Strength");
+            ui.add(egui::Slider::new(
+                &mut self.config.death_spiral.beat_pulse_strength,
+                0.0..=1.0,
+            ));
+
+            ui.add_space(4.0);
+            ui.label("Wave Amplitude");
+            ui.add(egui::Slider::new(
+                &mut self.config.death_spiral.wave_amplitude,
+                0.0..=0.5,
+            ));
+
+            ui.label("Wave Frequency");
+            ui.add(egui::Slider::new(
+                &mut self.config.death_spiral.wave_frequency,
+                1.0..=10.0,
+            ));
+
+            ui.label("Spiral Tightness");
+            ui.add(egui::Slider::new(
+                &mut self.config.death_spiral.spiral_tightness,
+                0.0..=0.3,
+            ));
+
+            ui.label("Follow Strength");
+            ui.add(egui::Slider::new(
+                &mut self.config.death_spiral.follow_strength,
+                0.1..=0.6,
+            ));
+        }
+
+        // Trail Settings
+        ui.add_space(12.0);
+        ui.separator();
+        ui.heading("Trails");
+
+        ui.checkbox(&mut self.config.trails.enabled, "Enable Trails");
+
+        if self.config.trails.enabled {
+            ui.label("Trail Length");
+            ui.add(egui::Slider::new(
+                &mut self.config.trails.max_length,
+                5..=50,
+            ));
+
+            ui.label("Fade Speed");
+            ui.add(egui::Slider::new(
+                &mut self.config.trails.fade_speed,
+                0.5..=5.0,
+            ));
+
+            ui.label("Spawn Rate");
+            ui.add(egui::Slider::new(
+                &mut self.config.trails.spawn_rate,
+                10.0..=60.0,
+            ));
+
+            ui.label("Trail Width");
+            ui.add(egui::Slider::new(
+                &mut self.config.trails.width_scale,
+                0.2..=1.0,
+            ));
+
+            ui.label("Opacity");
+            ui.add(egui::Slider::new(
+                &mut self.config.trails.opacity,
+                0.1..=1.0,
+            ));
+
+            ui.checkbox(&mut self.config.trails.glow_enabled, "Trail Glow");
+        }
+
+        // Connection Settings
+        ui.add_space(12.0);
+        ui.separator();
+        ui.heading("Connections");
+
+        ui.checkbox(&mut self.config.connections.enabled, "Enable Connections");
+
+        if self.config.connections.enabled {
+            ui.label("Max Distance");
+            ui.add(egui::Slider::new(
+                &mut self.config.connections.max_distance,
+                20.0..=200.0,
+            ));
+
+            ui.label("Max Connections");
+            ui.add(egui::Slider::new(
+                &mut self.config.connections.max_connections,
+                1..=10,
+            ));
+
+            ui.label("Opacity");
+            ui.add(egui::Slider::new(
+                &mut self.config.connections.opacity,
+                0.1..=1.0,
+            ));
+
+            ui.label("Thickness");
+            ui.add(egui::Slider::new(
+                &mut self.config.connections.thickness,
+                0.5..=5.0,
+            ));
+
+            ui.checkbox(&mut self.config.connections.audio_reactive, "Audio Reactive");
+            ui.checkbox(&mut self.config.connections.gradient_enabled, "Color Gradient");
+        }
     }
 
     fn render_audio_settings(&mut self, ui: &mut egui::Ui) {
@@ -1357,18 +1527,35 @@ impl ParticleStudioApp {
             self.spectrum.resize(rect.width(), rect.height());
             self.waveform.resize(rect.width(), rect.height());
 
-            // Update particles
-            let normalized_ref = if self.config.particles.adaptive_audio_enabled {
-                Some(&self.normalized_audio)
+            // Update particles based on mode
+            let speed_factor = self.config.particles.speed * 60.0 * dt;
+
+            if self.config.particles.mode == ParticleMode::DeathSpiral {
+                // Use specialized Death Spiral update
+                self.particles.update_death_spiral(
+                    &self.config.particles,
+                    &self.config.death_spiral,
+                    &self.audio_state,
+                    dt,
+                    speed_factor,
+                );
             } else {
-                None
-            };
-            self.particles.update(
-                &self.config.particles,
-                &self.audio_state,
-                dt,
-                normalized_ref,
-            );
+                // Standard particle update for other modes
+                let normalized_ref = if self.config.particles.adaptive_audio_enabled {
+                    Some(&self.normalized_audio)
+                } else {
+                    None
+                };
+                self.particles.update(
+                    &self.config.particles,
+                    &self.audio_state,
+                    dt,
+                    normalized_ref,
+                );
+            }
+
+            // Update trails
+            self.particles.update_trails(&self.config.trails, dt);
 
             let painter = ui.painter_at(rect);
             let colors = self.config.get_color_scheme();
@@ -1398,6 +1585,12 @@ impl ParticleStudioApp {
                 &colors,
                 &self.audio_state,
             );
+
+            // Draw trails (behind particles)
+            self.particles.render_trails(&painter, rect, &self.config.trails, &self.audio_state);
+
+            // Draw connections (behind particles)
+            self.particles.render_connections(&painter, rect, &self.config.connections, &self.audio_state);
 
             // Draw particles
             self.particles
