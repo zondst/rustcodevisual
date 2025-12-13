@@ -175,42 +175,17 @@ impl Default for NormalizedAudio {
     }
 }
 
-/// Adaptive audio normalizer using sliding window averaging
+/// Adaptive audio normalizer using smooth EMA (Exponential Moving Average)
 /// Automatically adjusts to track dynamics - quiet tracks get boosted, loud tracks get tamed
 pub struct AdaptiveAudioNormalizer {
-    // History buffers for sliding window (about 3 seconds at 30fps = ~90 samples)
-    bass_history: Vec<f32>,
-    mid_history: Vec<f32>,
-    high_history: Vec<f32>,
-
-    // Current running statistics
-    bass_avg: f32,
-    mid_avg: f32,
-    high_avg: f32,
-    bass_peak: f32,
-    mid_peak: f32,
-    high_peak: f32,
-
-    // Configuration
-    window_size: usize,
-    peak_decay: f32,
+    energy_avg: f32, // Smoothed average energy
 }
 
 impl AdaptiveAudioNormalizer {
-    pub fn new(window_seconds: f32, fps: u32) -> Self {
-        let window_size = (window_seconds * fps as f32) as usize;
+    pub fn new(_window_seconds: f32, _fps: u32) -> Self {
+        // Window size and fps are no longer needed for EMA approach, but kept in signature for compatibility
         Self {
-            bass_history: Vec::with_capacity(window_size),
-            mid_history: Vec::with_capacity(window_size),
-            high_history: Vec::with_capacity(window_size),
-            bass_avg: 0.0,
-            mid_avg: 0.0,
-            high_avg: 0.0,
-            bass_peak: 0.1, // Start with small non-zero to avoid division issues
-            mid_peak: 0.1,
-            high_peak: 0.1,
-            window_size: window_size.max(30), // At least 1 second
-            peak_decay: 0.995,                // Slow peak decay
+            energy_avg: 0.1, // Start with small non-zero
         }
     }
 
@@ -224,101 +199,58 @@ impl AdaptiveAudioNormalizer {
         bass_sensitivity: f32,
         mid_sensitivity: f32,
         high_sensitivity: f32,
-        strength: f32, // NEW: 0.0 = raw audio, 1.0 = fully adaptive, 2.0 = hyper-normalized
+        adaptive_strength: f32, // 0.0 - off, 1.0 - standard, >1.0 - aggressive
     ) -> NormalizedAudio {
-        // Add to history
-        self.bass_history.push(bass);
-        self.mid_history.push(mid);
-        self.high_history.push(high);
+        // 1. Calculate current energy (average)
+        let current_energy = (bass + mid + high) / 3.0;
 
-        // Trim to window size
-        if self.bass_history.len() > self.window_size {
-            self.bass_history.remove(0);
-            self.mid_history.remove(0);
-            self.high_history.remove(0);
-        }
+        // 2. Add to history for smoothing "average track volume"
+        // Using EMA (Exponential Moving Average) for adaptation
+        let adaptation_speed = 0.005; // How fast to get used to new volume
+        self.energy_avg =
+            self.energy_avg * (1.0 - adaptation_speed) + current_energy * adaptation_speed;
 
-        // Calculate running averages
-        let bass_sum: f32 = self.bass_history.iter().sum();
-        let mid_sum: f32 = self.mid_history.iter().sum();
-        let high_sum: f32 = self.high_history.iter().sum();
-        let count = self.bass_history.len() as f32;
+        // Safety against div by zero (silence)
+        let safe_avg = self.energy_avg.max(0.05);
 
-        self.bass_avg = bass_sum / count;
-        self.mid_avg = mid_sum / count;
-        self.high_avg = high_sum / count;
+        // 3. Calculate Gain
+        // We want the average signal to be visually around 0.5 (mid-point)
+        let target_level = 0.5;
+        let auto_gain = target_level / safe_avg;
 
-        // Update peaks with decay
-        self.bass_peak = (self.bass_peak * self.peak_decay)
-            .max(bass)
-            .max(self.bass_avg * 1.5);
-        self.mid_peak = (self.mid_peak * self.peak_decay)
-            .max(mid)
-            .max(self.mid_avg * 1.5);
-        self.high_peak = (self.high_peak * self.peak_decay)
-            .max(high)
-            .max(self.high_avg * 1.5);
+        // Blend fixed gain (1.0) and auto-gain based on setting
+        let final_gain = 1.0 + (auto_gain - 1.0) * adaptive_strength.clamp(0.0, 1.0);
 
-        // Normalize: (value - avg) / (peak - avg)
-        let bass_range = (self.bass_peak - self.bass_avg).max(0.01);
-        let mid_range = (self.mid_peak - self.mid_avg).max(0.01);
-        let high_range = (self.high_peak - self.high_avg).max(0.01);
+        // 4. Apply gain to frequencies
+        let bass_out = bass * final_gain * bass_sensitivity;
+        let mid_out = mid * final_gain * mid_sensitivity;
+        let high_out = high * final_gain * high_sensitivity;
 
-        // Normalized values (relative to local context)
-        let bass_normalized = ((bass - self.bass_avg) / bass_range).clamp(0.0, 1.5);
-        let mid_normalized = ((mid - self.mid_avg) / mid_range).clamp(0.0, 1.5);
-        let high_normalized = ((high - self.high_avg) / high_range).clamp(0.0, 1.5);
+        // 5. Soft-clipping to prevent hard cuts at 1.0
+        // Formula: x / (1 + x * 0.5) - allows nice overload display
+        let soft_clip = |x: f32| x / (1.0 + x * 0.5);
 
-        // Raw values scaled up for visibility
-        let bass_raw = (bass * 5.0).clamp(0.0, 1.0);
-        let mid_raw = (mid * 5.0).clamp(0.0, 1.0);
-        let high_raw = (high * 5.0).clamp(0.0, 1.0);
+        let bass_final = soft_clip(bass_out);
+        let mid_final = soft_clip(mid_out);
+        let high_final = soft_clip(high_out);
 
-        // BLEND: strength controls mix between raw and normalized
-        // strength=0 -> 100% raw, strength=1 -> 50/50, strength=2 -> 100% normalized
-        let blend = (strength * 0.5).clamp(0.0, 1.0);
-        let bass_blended = bass_raw * (1.0 - blend) + bass_normalized * blend;
-        let mid_blended = mid_raw * (1.0 - blend) + mid_normalized * blend;
-        let high_blended = high_raw * (1.0 - blend) + high_normalized * blend;
-
-        // Apply sensitivity
-        let bass_norm = bass_blended * bass_sensitivity;
-        let mid_norm = mid_blended * mid_sensitivity;
-        let high_norm = high_blended * high_sensitivity;
-
-        // Combined intensity with frequency weighting
-        let intensity = bass_norm * 0.5 + mid_norm * 0.35 + high_norm * 0.15;
-
-        // Detection thresholds - LESS STRICT for better reactivity
-        // Use raw audio for detection, not normalized (so silence is truly silent)
-        let raw_total = bass + mid + high;
-        let has_bass_hit = bass > self.bass_avg * 1.2 && bass > 0.02;
-        let has_vocal = mid > self.mid_avg * 1.2 && mid > 0.02;
-        // has_significant_audio: true if there's any audible sound
-        let has_significant_audio = raw_total > 0.01 || intensity > 0.1;
+        // Intensity for shaders
+        let intensity = bass_final * 0.5 + mid_final * 0.3 + high_final * 0.2;
 
         NormalizedAudio {
-            bass: bass_norm.clamp(0.0, 1.0),
-            mid: mid_norm.clamp(0.0, 1.0),
-            high: high_norm.clamp(0.0, 1.0),
+            bass: bass_final.clamp(0.0, 1.0),
+            mid: mid_final.clamp(0.0, 1.0),
+            high: high_final.clamp(0.0, 1.0),
             intensity: intensity.clamp(0.0, 1.0),
-            has_significant_audio,
-            has_bass_hit,
-            has_vocal,
+            has_significant_audio: current_energy > 0.01,
+            has_bass_hit: bass_final > 0.8, // Peak counts from normalized value
+            has_vocal: mid_final > 0.6,
         }
     }
 
     /// Reset the normalizer (e.g., when loading new track)
     pub fn reset(&mut self) {
-        self.bass_history.clear();
-        self.mid_history.clear();
-        self.high_history.clear();
-        self.bass_avg = 0.0;
-        self.mid_avg = 0.0;
-        self.high_avg = 0.0;
-        self.bass_peak = 0.1;
-        self.mid_peak = 0.1;
-        self.high_peak = 0.1;
+        self.energy_avg = 0.1;
     }
 }
 
