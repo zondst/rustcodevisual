@@ -1291,7 +1291,8 @@ impl ParticleEngine {
     ) {
         let steps = config.volumetric_steps.clamp(8, 48) as usize;
         let intensity = config.glow_intensity.clamp(0.1, 1.0);
-        let alpha_f32 = base_alpha as f32 * intensity;
+        // Reduced alpha multiplier to prevent oversaturation when many particles overlap
+        let alpha_f32 = base_alpha as f32 * intensity * 0.6;
 
         // Draw from outside in for proper layering
         for i in (0..steps).rev() {
@@ -1303,17 +1304,17 @@ impl ParticleEngine {
             // Gaussian falloff for smooth gradient: exp(-3 * t^2)
             let gaussian = (-3.0 * t * t).exp();
 
-            // Additional brightness boost at center
-            let center_boost = if t < 0.3 { 1.0 + (0.3 - t) * 2.0 } else { 1.0 };
+            // Reduced center brightness boost to prevent white blob
+            let center_boost = if t < 0.3 { 1.0 + (0.3 - t) * 0.8 } else { 1.0 };
 
-            let alpha = (alpha_f32 * gaussian * center_boost * 0.7) as u8;
+            let alpha = (alpha_f32 * gaussian * center_boost * 0.5) as u8;
 
             if alpha < 1 {
                 continue;
             }
 
-            // Slight brightening towards center
-            let brightness = (1.0 + (1.0 - t) * 0.3).min(1.5);
+            // Slight brightening towards center (reduced)
+            let brightness = (1.0 + (1.0 - t) * 0.15).min(1.3);
             let r = ((base_color.r() as f32 * brightness) as u8).min(255);
             let g = ((base_color.g() as f32 * brightness) as u8).min(255);
             let b = ((base_color.b() as f32 * brightness) as u8).min(255);
@@ -1322,14 +1323,14 @@ impl ParticleEngine {
             painter.circle_filled(pos, radius, layer_color);
         }
 
-        // Hot white center for extra pop
-        let center_alpha = (alpha_f32 * 0.9) as u8;
-        if center_alpha > 10 {
-            let r = (base_color.r() as u16 + 50).min(255) as u8;
-            let g = (base_color.g() as u16 + 50).min(255) as u8;
-            let b = (base_color.b() as u16 + 50).min(255) as u8;
+        // Subtle center highlight (reduced from +50 to +15 RGB)
+        let center_alpha = (alpha_f32 * 0.5) as u8;
+        if center_alpha > 15 {
+            let r = (base_color.r() as u16 + 15).min(255) as u8;
+            let g = (base_color.g() as u16 + 15).min(255) as u8;
+            let b = (base_color.b() as u16 + 15).min(255) as u8;
             let center_color = Color32::from_rgba_premultiplied(r, g, b, center_alpha);
-            painter.circle_filled(pos, size * 0.15, center_color);
+            painter.circle_filled(pos, size * 0.1, center_color);
         }
     }
 

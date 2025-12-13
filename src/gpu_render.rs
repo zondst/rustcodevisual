@@ -1313,10 +1313,9 @@ fn vs_main(
     let quad_pos = QUAD_POSITIONS[local_vertex_idx];
     let quad_uv = QUAD_UVS[local_vertex_idx];
 
-    // Scale by particle size with glow extension - BOOSTED to match preview volumetric rendering
-    // Preview's draw_volumetric_particle draws multiple layers from size*0.1 to size*1.5
-    // We need larger quads to accommodate the full glow effect plus extra for smooth edges
-    let glow_mult = 5.0 + params.glow_intensity * 2.5;
+    // Scale by particle size with glow extension
+    // Balanced to match preview volumetric rendering without oversaturation
+    let glow_mult = 3.5 + params.glow_intensity * 1.5;
     let size = p.size * p.audio_size * glow_mult;
 
     // Convert to clip space
@@ -1326,16 +1325,15 @@ fn vs_main(
 
     output.position = vec4<f32>(clip_x, clip_y, 0.0, 1.0);
 
-    // Compute alpha from life and audio - SIGNIFICANTLY boosted for better visibility
-    // Preview's particles are much more visible, so we need higher alpha
+    // Compute alpha from life and audio - balanced for cleaner rendering
     let life_alpha = clamp(p.life / p.max_life, 0.0, 1.0);
-    let alpha = clamp(life_alpha * p.audio_alpha * p.brightness * 2.0, 0.0, 1.0);
+    let alpha = clamp(life_alpha * p.audio_alpha * p.brightness * 1.2, 0.0, 1.0);
 
-    // Use colors directly with brightness boost - matches preview rendering
-    let boosted_color = p.color.rgb * 1.3;  // Boost color brightness
+    // Use colors with moderate brightness boost
+    let boosted_color = p.color.rgb * 1.1;
     output.color = vec4<f32>(boosted_color, alpha);
     output.uv = quad_uv;
-    output.glow = params.glow_intensity * 1.5;  // Boost glow intensity
+    output.glow = params.glow_intensity * 1.0;  // Original glow intensity
 
     return output;
 }
@@ -1372,50 +1370,47 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // =========================================================
-    // ENHANCED volumetric rendering to match preview quality
-    // Preview draws multiple concentric circles with varying alpha
-    // We simulate this with a smooth gradient that's brighter and more visible
+    // BALANCED volumetric rendering to prevent oversaturation
+    // Uses smooth gradient without excessive center brightness
     // =========================================================
 
     // t represents position in the gradient (0 = center, 1 = outer edge)
     let t = clamp(dist, 0.0, 1.0);
 
-    // STRONGER Gaussian falloff for more visible core
-    // Using exp(-2.0 * t * t) instead of -3.0 for wider bright area
-    let gaussian = exp(-2.0 * t * t);
+    // Gaussian falloff for smooth gradient
+    let gaussian = exp(-3.0 * t * t);
 
-    // STRONGER center brightness boost
-    // Creates a bright hot core that matches preview's layered rendering
+    // Reduced center brightness boost to prevent white blob
     let inner_t = 1.0 - t;  // 1 at center, 0 at edge
-    let center_boost = 1.0 + inner_t * inner_t * 2.0;  // Quadratic boost towards center
+    let center_boost = 1.0 + inner_t * inner_t * 0.8;  // Reduced quadratic boost
 
-    // Base intensity - increased from 0.7 to 1.0 for brighter particles
-    let base_intensity = gaussian * center_boost * 1.0;
+    // Reduced base intensity to prevent oversaturation when particles overlap
+    let base_intensity = gaussian * center_boost * 0.6;
 
-    // Glow extension - wider and stronger glow halo
-    let glow_fade = exp(-1.0 * t * t) * input.glow * 0.8;
+    // Glow extension - reduced for balanced appearance
+    let glow_fade = exp(-1.5 * t * t) * input.glow * 0.4;
 
-    // Combine for total intensity with minimum brightness
+    // Combine for total intensity
     let intensity = base_intensity + glow_fade;
 
     // Convert input color to linear space for correct blending
     // (input colors are in sRGB, GPU does linear blending)
     let linear_color = srgb_to_linear(input.color.rgb);
 
-    // Brightness towards center matching preview: (1.0 + (1.0 - t) * 0.3)
-    let brightness_mult = 1.0 + inner_t * 0.3;
+    // Reduced brightness towards center: (1.0 + (1.0 - t) * 0.15)
+    let brightness_mult = 1.0 + inner_t * 0.15;
     let brightened_color = linear_color * brightness_mult;
 
-    // Hot white center exactly as preview: +50/255 RGB when alpha > 0.04 (10/255)
-    let hot_center_strength = smoothstep(0.15, 0.0, dist);
+    // Subtle center highlight - reduced from +50/255 to +15/255 RGB
+    let hot_center_strength = smoothstep(0.1, 0.0, dist);
     let hot_center = select(
         vec3<f32>(0.0),
-        vec3<f32>(50.0 / 255.0) * hot_center_strength,
-        input.color.a > 0.04
+        vec3<f32>(15.0 / 255.0) * hot_center_strength,
+        input.color.a > 0.06
     );
 
-    // Glow intensity boost matching preview
-    let glow_boost = 1.0 + input.glow * 0.8;
+    // Reduced glow intensity boost
+    let glow_boost = 1.0 + input.glow * 0.4;
     let final_color = (brightened_color + hot_center) * intensity * glow_boost;
     let final_alpha = input.color.a * intensity;
 
