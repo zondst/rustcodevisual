@@ -13,6 +13,7 @@ pub enum ParticleMode {
     Calm,
     Cinematic,
     Orbit,
+    DeathSpiral,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
@@ -341,6 +342,222 @@ impl Default for PhysicsConfig {
 }
 
 // ============================================================================
+// Death Spiral Configuration (Ant Mill / Death Dance effect)
+// ============================================================================
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct DeathSpiralConfig {
+    /// Number of concentric spiral rings (2-8)
+    pub ring_count: usize,
+
+    /// Base radius of the innermost ring
+    pub inner_radius: f32,
+
+    /// Multiplier for distance between rings (1.2-2.0)
+    pub ring_spacing: f32,
+
+    /// Base rotation speed in radians/sec
+    pub base_rotation_speed: f32,
+
+    /// Alternate rotation direction for each ring
+    pub alternate_direction: bool,
+
+    /// Audio influence on rotation speed (0.0-1.0)
+    pub audio_speed_influence: f32,
+
+    /// Audio influence on ring radius (0.0-1.0)
+    pub audio_radius_influence: f32,
+
+    /// Trail intensity for pheromone effect (0.0-1.0)
+    pub trail_intensity: f32,
+
+    /// Particles per ring
+    pub particles_per_ring: usize,
+
+    /// Wave amplitude for organic breathing effect (0.0-0.5)
+    pub wave_amplitude: f32,
+
+    /// Wave frequency (number of waves around the ring)
+    pub wave_frequency: f32,
+
+    /// Spiral tightness - adds inward/outward spiral motion (0.0-0.3)
+    pub spiral_tightness: f32,
+
+    /// Size pulse strength on beat (0.0-1.0)
+    pub beat_pulse_strength: f32,
+
+    /// Follow strength - how strongly particles follow target position (0.1-0.6)
+    pub follow_strength: f32,
+}
+
+impl Default for DeathSpiralConfig {
+    fn default() -> Self {
+        Self {
+            ring_count: 5,
+            inner_radius: 100.0,
+            ring_spacing: 1.5,
+            base_rotation_speed: 0.8,
+            alternate_direction: true,
+            audio_speed_influence: 0.6,
+            audio_radius_influence: 0.3,
+            trail_intensity: 0.7,
+            particles_per_ring: 60,
+            wave_amplitude: 0.15,
+            wave_frequency: 3.0,
+            spiral_tightness: 0.1,
+            beat_pulse_strength: 0.4,
+            follow_strength: 0.3,
+        }
+    }
+}
+
+// ============================================================================
+// Trail System Configuration (Pheromone trails)
+// ============================================================================
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct TrailConfig {
+    /// Enable trail rendering
+    pub enabled: bool,
+
+    /// Maximum trail points per particle
+    pub max_length: usize,
+
+    /// Trail fade speed (how fast trails disappear)
+    pub fade_speed: f32,
+
+    /// Trail spawn rate (points per second)
+    pub spawn_rate: f32,
+
+    /// Trail width relative to particle size
+    pub width_scale: f32,
+
+    /// Glow effect on trails
+    pub glow_enabled: bool,
+
+    /// Trail opacity multiplier
+    pub opacity: f32,
+}
+
+impl Default for TrailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_length: 15,
+            fade_speed: 2.0,
+            spawn_rate: 30.0,
+            width_scale: 0.6,
+            glow_enabled: true,
+            opacity: 0.7,
+        }
+    }
+}
+
+// ============================================================================
+// Connection System Configuration (Energy links between particles)
+// ============================================================================
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct ConnectionConfig {
+    /// Enable particle connections
+    pub enabled: bool,
+
+    /// Maximum distance for connection
+    pub max_distance: f32,
+
+    /// Maximum connections per particle
+    pub max_connections: usize,
+
+    /// Connection line opacity
+    pub opacity: f32,
+
+    /// Connection line thickness
+    pub thickness: f32,
+
+    /// React to audio (connections pulse with music)
+    pub audio_reactive: bool,
+
+    /// Enable gradient between particle colors
+    pub gradient_enabled: bool,
+}
+
+impl Default for ConnectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_distance: 80.0,
+            max_connections: 3,
+            opacity: 0.3,
+            thickness: 1.0,
+            audio_reactive: true,
+            gradient_enabled: true,
+        }
+    }
+}
+
+// ============================================================================
+// Cinematic Effects Configuration
+// ============================================================================
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct CinematicConfig {
+    /// Enable chromatic aberration
+    pub chromatic_enabled: bool,
+
+    /// Chromatic aberration intensity (0.0-1.0)
+    pub chromatic_intensity: f32,
+
+    /// Radial chromatic (stronger towards edges)
+    pub chromatic_radial: bool,
+
+    /// Enable film grain
+    pub grain_enabled: bool,
+
+    /// Film grain intensity (0.0-1.0)
+    pub grain_intensity: f32,
+
+    /// Film grain size (1.0-3.0)
+    pub grain_size: f32,
+
+    /// Enable vignette
+    pub vignette_enabled: bool,
+
+    /// Vignette intensity (0.0-1.0)
+    pub vignette_intensity: f32,
+
+    /// Vignette softness (0.0-1.0)
+    pub vignette_softness: f32,
+
+    /// Enable letterbox (cinematic bars)
+    pub letterbox_enabled: bool,
+
+    /// Letterbox aspect ratio (2.35 for anamorphic, 1.85 for standard)
+    pub letterbox_ratio: f32,
+
+    /// Color temperature (-1.0 cold to 1.0 warm)
+    pub color_temperature: f32,
+}
+
+impl Default for CinematicConfig {
+    fn default() -> Self {
+        Self {
+            chromatic_enabled: false,
+            chromatic_intensity: 0.3,
+            chromatic_radial: true,
+            grain_enabled: false,
+            grain_intensity: 0.1,
+            grain_size: 1.5,
+            vignette_enabled: true,
+            vignette_intensity: 0.3,
+            vignette_softness: 0.5,
+            letterbox_enabled: false,
+            letterbox_ratio: 2.35,
+            color_temperature: 0.0,
+        }
+    }
+}
+
+// ============================================================================
 // Audio Configuration
 // ============================================================================
 
@@ -618,6 +835,15 @@ pub struct AppConfig {
     pub export: ExportConfig,
     pub background: BackgroundConfig,
     pub color_scheme_index: usize,
+    // New configurations
+    #[serde(default)]
+    pub death_spiral: DeathSpiralConfig,
+    #[serde(default)]
+    pub trails: TrailConfig,
+    #[serde(default)]
+    pub connections: ConnectionConfig,
+    #[serde(default)]
+    pub cinematic: CinematicConfig,
 }
 
 impl AppConfig {
@@ -651,11 +877,13 @@ impl AppConfig {
     /// Get all available preset names
     pub fn preset_names() -> Vec<&'static str> {
         vec![
-            "Default", "Cinematic", "Ambient", "Energetic", "Minimal", 
-            "Psychedelic", "Starfield", "Fractal Flow", "GPU Sim", 
+            "Default", "Cinematic", "Ambient", "Energetic", "Minimal",
+            "Psychedelic", "Starfield", "Fractal Flow", "GPU Sim",
             "Audio Reactive", "Spectrum Bars",
             // New sample-inspired presets
-            "Particles GPU", "Audio Fractals", "VJ Reactive", "Bloom Intensive"
+            "Particles GPU", "Audio Fractals", "VJ Reactive", "Bloom Intensive",
+            // Death Spiral presets
+            "Ant Dance", "Hypnotic Vortex"
         ]
     }
     
@@ -677,6 +905,8 @@ impl AppConfig {
             "Audio Fractals" => self.preset_audio_fractals(),
             "VJ Reactive" => self.preset_vj_reactive(),
             "Bloom Intensive" => self.preset_bloom_intensive(),
+            "Ant Dance" => self.preset_ant_dance(),
+            "Hypnotic Vortex" => self.preset_hypnotic_vortex(),
             _ => {}
         }
     }
@@ -1340,5 +1570,208 @@ impl AppConfig {
         self.spectrum.style = SpectrumStyle::Circle;
         self.waveform.enabled = false;
         self.color_scheme_index = 3; // Aurora
+    }
+
+    // ========================================================================
+    // DEATH SPIRAL PRESETS
+    // ========================================================================
+
+    /// Ant Dance preset - inspired by ant mill / death spiral phenomenon
+    /// Hypnotic concentric rings of particles following each other
+    pub fn preset_ant_dance(&mut self) {
+        // Bioluminescence color scheme
+        self.color_scheme_index = 3; // Aurora (closest to bioluminescence)
+
+        // Death Spiral mode
+        self.particles = ParticleConfig {
+            enabled: true,
+            count: 2000,
+            min_size: 2.0,
+            max_size: 5.0,
+            speed: 0.6,
+            trail_length: 15,
+            mode: ParticleMode::DeathSpiral,
+            shape: ParticleShape::Glow,
+            blend_mode: BlendMode::Add,
+            spread: 360.0,
+            gravity: 0.0,
+            size_variation: 0.3,
+            breathing_scale: 0.2,
+            orbit_speed: 0.1,
+            beat_size_pulse: 1.5,
+            glow_intensity: 0.8,
+            damping: 2.5,
+            volumetric_rendering: true,
+            volumetric_steps: 32,
+            ..Default::default()
+        };
+
+        // Death Spiral specific settings
+        self.death_spiral = DeathSpiralConfig {
+            ring_count: 6,
+            inner_radius: 80.0,
+            ring_spacing: 1.4,
+            base_rotation_speed: 0.6,
+            alternate_direction: true,
+            audio_speed_influence: 0.8,
+            audio_radius_influence: 0.4,
+            trail_intensity: 0.85,
+            particles_per_ring: 70,
+            wave_amplitude: 0.2,
+            wave_frequency: 4.0,
+            spiral_tightness: 0.05,
+            beat_pulse_strength: 0.5,
+            follow_strength: 0.4,
+        };
+
+        // Enable trails for pheromone effect
+        self.trails = TrailConfig {
+            enabled: true,
+            max_length: 20,
+            fade_speed: 1.5,
+            spawn_rate: 40.0,
+            width_scale: 0.6,
+            glow_enabled: true,
+            opacity: 0.7,
+        };
+
+        // Enable connections
+        self.connections = ConnectionConfig {
+            enabled: true,
+            max_distance: 60.0,
+            max_connections: 3,
+            opacity: 0.3,
+            thickness: 1.0,
+            audio_reactive: true,
+            gradient_enabled: true,
+        };
+
+        // Visual effects
+        self.visual.bloom_enabled = true;
+        self.visual.bloom_intensity = 0.7;
+        self.visual.bloom_threshold = 0.3;
+        self.visual.bloom_radius = 15.0;
+        self.visual.vignette_strength = 0.4;
+        self.visual.motion_blur = 0.1;
+        self.visual.echo_enabled = false;
+
+        // Audio settings
+        self.audio.smoothing = 0.5;
+        self.audio.beat_attack = 0.6;
+        self.audio.beat_decay = 0.3;
+
+        self.spectrum.enabled = false;
+        self.waveform.enabled = true;
+        self.waveform.style = WaveformStyle::Circle;
+        self.waveform.amplitude = 50.0;
+    }
+
+    /// Hypnotic Vortex preset - intense, fast-spinning death spiral
+    /// Maximum visual impact with chromatic aberration and radial blur
+    pub fn preset_hypnotic_vortex(&mut self) {
+        // Neon color scheme for maximum contrast
+        self.color_scheme_index = 4; // Neon
+
+        self.particles = ParticleConfig {
+            enabled: true,
+            count: 3000,
+            min_size: 2.5,
+            max_size: 6.0,
+            speed: 0.8,
+            trail_length: 20,
+            mode: ParticleMode::DeathSpiral,
+            shape: ParticleShape::Glow,
+            blend_mode: BlendMode::Add,
+            spread: 360.0,
+            gravity: 0.0,
+            size_variation: 0.4,
+            breathing_scale: 0.3,
+            orbit_speed: 0.15,
+            beat_size_pulse: 2.5,
+            glow_intensity: 0.9,
+            damping: 2.0,
+            volumetric_rendering: true,
+            volumetric_steps: 24,
+            ..Default::default()
+        };
+
+        // More aggressive spiral settings
+        self.death_spiral = DeathSpiralConfig {
+            ring_count: 8,
+            inner_radius: 50.0,
+            ring_spacing: 1.3,
+            base_rotation_speed: 1.2,
+            alternate_direction: true,
+            audio_speed_influence: 1.0,
+            audio_radius_influence: 0.5,
+            trail_intensity: 0.95,
+            particles_per_ring: 80,
+            wave_amplitude: 0.3,
+            wave_frequency: 6.0,
+            spiral_tightness: 0.15,
+            beat_pulse_strength: 0.7,
+            follow_strength: 0.5,
+        };
+
+        // Long, intense trails
+        self.trails = TrailConfig {
+            enabled: true,
+            max_length: 30,
+            fade_speed: 1.0,
+            spawn_rate: 50.0,
+            width_scale: 0.5,
+            glow_enabled: true,
+            opacity: 0.85,
+        };
+
+        // Dense connections
+        self.connections = ConnectionConfig {
+            enabled: true,
+            max_distance: 50.0,
+            max_connections: 4,
+            opacity: 0.4,
+            thickness: 1.5,
+            audio_reactive: true,
+            gradient_enabled: true,
+        };
+
+        // Cinematic effects
+        self.cinematic = CinematicConfig {
+            chromatic_enabled: true,
+            chromatic_intensity: 0.4,
+            chromatic_radial: true,
+            grain_enabled: true,
+            grain_intensity: 0.05,
+            grain_size: 1.5,
+            vignette_enabled: true,
+            vignette_intensity: 0.5,
+            vignette_softness: 0.6,
+            letterbox_enabled: false,
+            letterbox_ratio: 2.35,
+            color_temperature: 0.0,
+        };
+
+        // Heavy bloom and effects
+        self.visual.bloom_enabled = true;
+        self.visual.bloom_intensity = 1.2;
+        self.visual.bloom_threshold = 0.25;
+        self.visual.bloom_radius = 25.0;
+        self.visual.chromatic_aberration = 0.3;
+        self.visual.radial_blur_enabled = true;
+        self.visual.radial_blur_amount = 0.1;
+        self.visual.vignette_strength = 0.5;
+        self.visual.echo_enabled = true;
+        self.visual.echo_zoom = 1.008;
+        self.visual.echo_rotation = 0.01;
+        self.visual.echo_alpha = 0.3;
+
+        // Responsive audio
+        self.audio.smoothing = 0.3;
+        self.audio.beat_attack = 0.8;
+        self.audio.beat_decay = 0.4;
+        self.audio.beat_explosion_strength = 5.0;
+
+        self.spectrum.enabled = false;
+        self.waveform.enabled = false;
     }
 }
