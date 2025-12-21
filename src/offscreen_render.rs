@@ -360,7 +360,22 @@ pub fn run_headless_export(
         };
 
         // 4. Update particles
-        particles.update(&config.particles, &audio_state, dt, normalized.as_ref());
+        // Pass Death Spiral config
+        let death_spiral_config =
+            if config.particles.mode == crate::config::ParticleMode::DeathSpiral {
+                Some(&config.death_spiral)
+            } else {
+                None
+            };
+
+        particles.update(
+            &config.particles,
+            &config.connections,
+            death_spiral_config,
+            &audio_state,
+            dt,
+            normalized.as_ref(),
+        );
 
         // 5. Render frame
         let frame_data = frame_renderer.render_frame(&particles, &config, &audio_state);

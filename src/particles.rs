@@ -2,12 +2,15 @@
 //! Advanced particle system with physics, audio reactivity, and multiple modes
 
 use crate::audio::{AudioState, NormalizedAudio};
-use crate::config::{ColorScheme, DeathSpiralConfig, ParticleConfig, ParticleMode, ParticleShape, TrailConfig, ConnectionConfig};
+use crate::config::{
+    ColorScheme, ConnectionConfig, DeathSpiralConfig, ParticleConfig, ParticleMode, ParticleShape,
+    TrailConfig,
+};
 use egui::{Color32, Painter, Pos2, Rect, Stroke, Vec2};
 use rand::Rng;
 use rayon::prelude::*;
-use std::f32::consts::PI;
 use std::collections::HashMap;
+use std::f32::consts::PI;
 
 /// Individual particle data
 #[derive(Clone)]
@@ -27,8 +30,8 @@ pub struct Particle {
     pub audio_alpha: f32, // Opacity driven by audio (0.0-1.0)
     pub audio_size: f32,  // Size multiplier from audio
     // Death Spiral state
-    pub ring_index: usize,      // Which ring this particle belongs to
-    pub position_in_ring: f32,  // Position within the ring (0.0-1.0)
+    pub ring_index: usize,     // Which ring this particle belongs to
+    pub position_in_ring: f32, // Position within the ring (0.0-1.0)
 }
 
 impl Default for Particle {
@@ -57,7 +60,7 @@ impl Default for Particle {
 #[derive(Clone, Copy)]
 pub struct TrailPoint {
     pub pos: Vec2,
-    pub age: f32,      // 0.0 = new, 1.0 = fully faded
+    pub age: f32, // 0.0 = new, 1.0 = fully faded
     pub size: f32,
     pub brightness: f32,
     pub color: Color32,
@@ -107,7 +110,8 @@ impl TrailSystem {
 
         // Ensure we have enough trail vectors
         if self.trails.len() < particles.len() {
-            self.trails.resize(particles.len(), Vec::with_capacity(self.max_trail_length));
+            self.trails
+                .resize(particles.len(), Vec::with_capacity(self.max_trail_length));
         }
 
         for (i, particle) in particles.iter().enumerate() {
@@ -119,18 +123,32 @@ impl TrailSystem {
 
             // Add new point if spawning and particle is visible
             if should_spawn && particle.audio_alpha > 0.1 {
-                let point = TrailPoint {
-                    pos: particle.pos,
-                    age: 0.0,
-                    size: particle.size * config.width_scale,
-                    brightness: particle.brightness * config.opacity,
-                    color: particle.color,
-                };
-
-                if trail.len() >= self.max_trail_length {
-                    trail.remove(0);
+                // Check for wrap-around (large distance from last point)
+                let mut is_wrap = false;
+                if let Some(last) = trail.last() {
+                    let dx = (particle.pos.x - last.pos.x).abs();
+                    let dy = (particle.pos.y - last.pos.y).abs();
+                    if dx > 100.0 || dy > 100.0 {
+                        is_wrap = true;
+                    }
                 }
-                trail.push(point);
+
+                if is_wrap {
+                    trail.clear();
+                } else {
+                    let point = TrailPoint {
+                        pos: particle.pos,
+                        age: 0.0,
+                        size: particle.size * config.width_scale,
+                        brightness: particle.brightness * config.opacity,
+                        color: particle.color,
+                    };
+
+                    if trail.len() >= self.max_trail_length {
+                        trail.remove(0);
+                    }
+                    trail.push(point);
+                }
             }
 
             // Update age and remove old points
@@ -143,7 +161,8 @@ impl TrailSystem {
     }
 
     pub fn resize(&mut self, particle_count: usize) {
-        self.trails.resize(particle_count, Vec::with_capacity(self.max_trail_length));
+        self.trails
+            .resize(particle_count, Vec::with_capacity(self.max_trail_length));
     }
 
     pub fn render(&self, painter: &Painter, rect: Rect, config: &TrailConfig, _audio: &AudioState) {
@@ -206,6 +225,50 @@ pub struct Connection {
     pub strength: f32,
 }
 
+pub struct SpatialGrid {
+    cell_size: f32,
+    cells: HashMap<(i32, i32), Vec<usize>>,
+}
+
+impl SpatialGrid {
+    pub fn new(cell_size: f32) -> Self {
+        Self {
+            cell_size,
+            cells: HashMap::new(),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        for cells in self.cells.values_mut() {
+            cells.clear();
+        }
+    }
+
+    pub fn insert(&mut self, index: usize, pos: Vec2) {
+        let cell = (
+            (pos.x / self.cell_size).floor() as i32,
+            (pos.y / self.cell_size).floor() as i32,
+        );
+        self.cells.entry(cell).or_default().push(index);
+    }
+
+    pub fn query_radius(&self, pos: Vec2, radius: f32) -> Vec<usize> {
+        let mut neighbors = Vec::new();
+        let cell_x = (pos.x / self.cell_size).floor() as i32;
+        let cell_y = (pos.y / self.cell_size).floor() as i32;
+        let search_range = (radius / self.cell_size).ceil() as i32;
+
+        for dx in -search_range..=search_range {
+            for dy in -search_range..=search_range {
+                if let Some(indices) = self.cells.get(&(cell_x + dx, cell_y + dy)) {
+                    neighbors.extend_from_slice(indices);
+                }
+            }
+        }
+        neighbors
+    }
+}
+
 /// Particle Engine managing all particles
 pub struct ParticleEngine {
     pub particles: Vec<Particle>,
@@ -222,6 +285,12 @@ pub struct ParticleEngine {
     // Trail system
     pub trail_system: TrailSystem,
 
+    // Spatial Grid for optimizations
+    spatial_grid: SpatialGrid,
+
+    // Connections cache
+    pub connections: Vec<Connection>,
+
     // Death Spiral state
     death_spiral_initialized: bool,
 }
@@ -236,6 +305,8 @@ impl ParticleEngine {
             flow_field_time: 0.0,
             palette: vec![Color32::WHITE],
             trail_system: TrailSystem::new(10000, 20),
+            spatial_grid: SpatialGrid::new(40.0),
+            connections: Vec::new(),
             death_spiral_initialized: false,
         }
     }
@@ -260,6 +331,8 @@ impl ParticleEngine {
     pub fn update(
         &mut self,
         config: &ParticleConfig,
+        connection_config: &ConnectionConfig,
+        death_spiral_config: Option<&DeathSpiralConfig>,
         audio: &AudioState,
         dt: f32,
         normalized: Option<&NormalizedAudio>,
@@ -336,12 +409,57 @@ impl ParticleEngine {
         let speed_factor = config.speed * 60.0 * dt;
 
         // Apply mode-specific forces
-        match config.mode {
-            ParticleMode::Chaos => self.update_chaos(config, audio, dt, speed_factor),
-            ParticleMode::Calm => self.update_calm(config, audio, dt, speed_factor),
-            ParticleMode::Cinematic => self.update_cinematic(config, audio, dt, speed_factor),
-            ParticleMode::Orbit => self.update_orbit(config, audio, dt, speed_factor),
-            ParticleMode::DeathSpiral => {} // Handled separately with spiral config
+        // Apply mode-specific forces
+        if config.mode == ParticleMode::Chaos {
+            self.update_chaos(config, audio, dt, speed_factor, normalized);
+        } else if config.mode == ParticleMode::Calm {
+            self.update_calm(config, audio, dt, speed_factor, normalized);
+        } else if config.mode == ParticleMode::Cinematic {
+            self.update_cinematic(config, audio, dt, speed_factor, normalized);
+        } else if config.mode == ParticleMode::Orbit {
+            self.update_orbit(config, audio, dt, speed_factor, normalized);
+        } else if config.mode == ParticleMode::DeathSpiral {
+            if let Some(spiral_config) = death_spiral_config {
+                self.update_death_spiral(
+                    config,
+                    spiral_config,
+                    audio,
+                    dt,
+                    speed_factor,
+                    normalized,
+                );
+            }
+        }
+
+        // Calculate connections once per frame
+        // Grid Maintenance
+        // We must rebuild grid if EITHER connections OR repulsion is enabled to avoid stale indices panic
+        let mut grid_cell_size: f32 = 0.0;
+        if connection_config.enabled {
+            grid_cell_size = grid_cell_size.max(connection_config.max_distance);
+        }
+        if config.repulsion_enabled {
+            grid_cell_size = grid_cell_size.max(config.repulsion_radius);
+        }
+
+        if grid_cell_size > 0.0 {
+            // Update grid settings if needed (allow some tolerance to avoid thrashing)
+            if (self.spatial_grid.cell_size - grid_cell_size).abs() > 5.0 {
+                self.spatial_grid = SpatialGrid::new(grid_cell_size);
+            }
+
+            // Critical: Rebuild grid with CURRENT particles prevents panic
+            self.spatial_grid.clear();
+            for (i, p) in self.particles.iter().enumerate() {
+                self.spatial_grid.insert(i, p.pos);
+            }
+        }
+
+        // Calculate connections once per frame
+        if connection_config.enabled {
+            self.connections = self.find_connections(connection_config, audio);
+        } else {
+            self.connections.clear();
         }
 
         // ========================================================
@@ -349,8 +467,59 @@ impl ParticleEngine {
         // ========================================================
         let width = self.width;
         let height = self.height;
+        let repulsion_enabled = config.repulsion_enabled;
+        let repulsion_strength = config.repulsion_strength;
+        let repulsion_radius = config.repulsion_radius;
+        let _spatial_for_repulsion = if repulsion_enabled {
+            Some(&self.spatial_grid)
+        } else {
+            None
+        };
 
-        self.particles.par_iter_mut().for_each(|p| {
+        // We can't use parallel iteration easily if we need random access for repulsion via grid
+        // So we'll iterate sequentially or use a two-pass approach
+        // For now, sequential update for repulsion simplicity
+
+        let particle_count = self.particles.len();
+
+        // Create a copy of positions for repulsion query to avoid borrowing issues
+        let positions: Vec<Vec2> = if repulsion_enabled {
+            self.particles.iter().map(|p| p.pos).collect()
+        } else {
+            Vec::new()
+        };
+
+        for i in 0..particle_count {
+            // -- REPULSION --
+            if repulsion_enabled {
+                let p_pos = positions[i];
+                let neighbors = self.spatial_grid.query_radius(p_pos, repulsion_radius);
+                let mut force = Vec2::ZERO;
+
+                for &j in &neighbors {
+                    if i == j {
+                        continue;
+                    }
+                    let other_pos = positions[j];
+                    let dx = p_pos.x - other_pos.x;
+                    let dy = p_pos.y - other_pos.y;
+                    let dist_sq = dx * dx + dy * dy;
+
+                    if dist_sq < repulsion_radius * repulsion_radius && dist_sq > 0.1 {
+                        let dist = dist_sq.sqrt();
+                        let f = (1.0 - dist / repulsion_radius) * repulsion_strength;
+                        force.x += (dx / dist) * f;
+                        force.y += (dy / dist) * f;
+                    }
+                }
+
+                // Check bounds to avoid panic
+                if let Some(p) = self.particles.get_mut(i) {
+                    p.vel += force * dt * 60.0;
+                }
+            }
+
+            let p = &mut self.particles[i];
             // -- BEAT PHYSICS: Velocity burst away from center --
             if is_strong_beat && config.beat_burst_strength > 0.0 {
                 let dir = Vec2::new(p.pos.x - center.x, p.pos.y - center.y);
@@ -435,7 +604,7 @@ impl ParticleEngine {
             if p.pos.y > height + 50.0 {
                 p.pos.y = -50.0;
             }
-        });
+        }
 
         // ========================================================
         // RULE 4: Remove particles when fully faded or dead
@@ -506,6 +675,8 @@ impl ParticleEngine {
             brightness: 1.0,
             audio_alpha: 0.1, // Start low, will ramp up
             audio_size: audio.smooth_amplitude.clamp(0.3, 1.0),
+            ring_index: 0,
+            position_in_ring: 0.0,
         };
 
         self.particles.push(particle);
@@ -517,9 +688,17 @@ impl ParticleEngine {
         audio: &AudioState,
         _dt: f32,
         speed_factor: f32,
+        normalized: Option<&NormalizedAudio>,
     ) {
         let center = Vec2::new(self.width / 2.0, self.height / 2.0);
         let flow_field_time = self.flow_field_time;
+
+        // Resolve effective audio values
+        let (eff_mid, eff_beat) = if let Some(norm) = normalized {
+            (norm.mid, if norm.has_bass_hit { 1.0 } else { 0.0 })
+        } else {
+            (audio.mid, audio.beat)
+        };
 
         self.particles.par_iter_mut().for_each(|p| {
             // Curl noise flow field
@@ -530,16 +709,16 @@ impl ParticleEngine {
             let flow_x = (ny * 6.0).sin() + (nx * 3.0).cos() * 0.5;
             let flow_y = (nx * 6.0).cos() + (ny * 3.0).sin() * 0.5;
 
-            p.vel.x += flow_x * 0.1 * speed_factor * (1.0 + audio.mid);
-            p.vel.y += flow_y * 0.1 * speed_factor * (1.0 + audio.mid);
+            p.vel.x += flow_x * 0.1 * speed_factor * (1.0 + eff_mid);
+            p.vel.y += flow_y * 0.1 * speed_factor * (1.0 + eff_mid);
 
             // Beat explosion
-            if audio.beat > 0.5 {
+            if eff_beat > 0.5 {
                 let dx = p.pos.x - center.x;
                 let dy = p.pos.y - center.y;
                 let dist = (dx * dx + dy * dy).sqrt().max(1.0);
 
-                let force = audio.beat * config.speed * 2.0;
+                let force = eff_beat * config.speed * 2.0;
                 p.vel.x += (dx / dist) * force;
                 p.vel.y += (dy / dist) * force;
             }
@@ -558,12 +737,16 @@ impl ParticleEngine {
         audio: &AudioState,
         _dt: f32,
         speed_factor: f32,
+        normalized: Option<&NormalizedAudio>,
     ) {
         let time = self.time;
+        // Resolve effective audio
+        let eff_amp = normalized.map(|n| n.intensity).unwrap_or(audio.amplitude);
+
         self.particles.par_iter_mut().for_each(|p| {
             // Gentle floating motion
             let float_x = (time * 0.5 + p.pos.y * 0.01).sin() * 0.02;
-            let float_y = -0.02 - audio.amplitude * 0.03;
+            let float_y = -0.02 - eff_amp * 0.03;
 
             p.vel.x += float_x * speed_factor;
             p.vel.y += float_y * speed_factor;
@@ -578,24 +761,51 @@ impl ParticleEngine {
 
     fn update_cinematic(
         &mut self,
-        _config: &ParticleConfig,
+        config: &ParticleConfig,
         audio: &AudioState,
-        _dt: f32,
+        dt: f32,
         speed_factor: f32,
+        normalized: Option<&NormalizedAudio>,
     ) {
+        let center = Vec2::new(self.width / 2.0, self.height / 2.0);
         let time = self.time;
+        // Resolve effective audio
+        let eff_beat = normalized
+            .map(|n| if n.has_bass_hit { 1.0 } else { 0.0 })
+            .unwrap_or(audio.beat);
+
         self.particles.par_iter_mut().for_each(|p| {
-            // Very slow, smooth motion
-            let breathing = (time * 0.3 + p.pos.x * 0.001).sin();
+            let dx = p.pos.x - center.x;
+            let dy = p.pos.y - center.y;
+            let dist = (dx * dx + dy * dy).sqrt().max(1.0);
 
-            p.vel.x += breathing * 0.005 * speed_factor;
-            p.vel.y += (time * 0.2).cos() * 0.003 * speed_factor;
+            // Audio-driven speed control
+            let audio_energy = normalized
+                .map(|n| n.intensity)
+                .unwrap_or(audio.smooth_amplitude)
+                .clamp(0.0, 1.0);
+            let dynamic_speed = config.speed * (0.2 + 0.8 * audio_energy);
 
-            // High damping
-            p.vel *= 0.95;
+            // Slow orbital motion
+            let angle = dist * 0.005 + time * 0.1;
+            let target_vel_x = -angle.sin() * dynamic_speed * 10.0;
+            let target_vel_y = angle.cos() * dynamic_speed * 10.0;
 
-            // Size breathing effect is more pronounced
-            p.size = p.base_size * (1.0 + breathing * 0.3 + audio.amplitude * 0.4);
+            // Smoothly interpolate velocity
+            let lerp_factor = 2.0 * dt;
+            p.vel.x += (target_vel_x - p.vel.x) * lerp_factor;
+            p.vel.y += (target_vel_y - p.vel.y) * lerp_factor;
+
+            // Gentle push out on beat
+            if eff_beat > 0.2 {
+                let push = eff_beat * 0.5 * speed_factor;
+                p.vel.x += (dx / dist) * push;
+                p.vel.y += (dy / dist) * push;
+            }
+
+            // Strong damping, stronger on silence to stop "floating aimlessly"
+            let damping = if audio_energy < 0.05 { 0.90 } else { 0.99 };
+            p.vel *= damping;
         });
     }
 
@@ -605,8 +815,18 @@ impl ParticleEngine {
         audio: &AudioState,
         _dt: f32,
         speed_factor: f32,
+        normalized: Option<&NormalizedAudio>,
     ) {
         let center = Vec2::new(self.width / 2.0, self.height / 2.0);
+
+        // Resolve effective audio
+        let eff_beat = normalized
+            .map(|n| if n.has_bass_hit { 1.0 } else { 0.0 })
+            .unwrap_or(audio.beat);
+        let audio_energy = normalized
+            .map(|n| n.intensity)
+            .unwrap_or(audio.smooth_amplitude)
+            .clamp(0.0, 1.0);
 
         self.particles.par_iter_mut().for_each(|p| {
             let dx = p.pos.x - center.x;
@@ -617,7 +837,8 @@ impl ParticleEngine {
             let perp_x = -dy / dist;
             let perp_y = dx / dist;
 
-            let orbit_speed = config.orbit_speed * (1.0 + audio.beat * 0.5);
+            let orbit_speed =
+                config.orbit_speed * (0.3 + 0.7 * audio_energy) * (1.0 + eff_beat * 0.5);
             p.vel.x += perp_x * orbit_speed * speed_factor;
             p.vel.y += perp_y * orbit_speed * speed_factor;
 
@@ -626,8 +847,9 @@ impl ParticleEngine {
             p.vel.x -= (dx / dist) * pull_strength * speed_factor;
             p.vel.y -= (dy / dist) * pull_strength * speed_factor;
 
-            // Moderate damping
-            p.vel *= 0.97;
+            // Moderate damping, brake on silence
+            let damping = if audio_energy < 0.05 { 0.92 } else { 0.97 };
+            p.vel *= damping;
         });
     }
 
@@ -640,9 +862,22 @@ impl ParticleEngine {
         audio: &AudioState,
         dt: f32,
         speed_factor: f32,
+        normalized: Option<&NormalizedAudio>,
     ) {
         let center = Vec2::new(self.width / 2.0, self.height / 2.0);
         let time = self.time;
+
+        // Resolve effective audio
+        let (eff_bass, eff_amp, eff_beat) = if let Some(norm) = normalized {
+            // Map normalized 0-1 range to similar scale as raw audio might trigger
+            (
+                norm.bass,
+                norm.intensity,
+                if norm.has_bass_hit { 0.8 } else { 0.0 },
+            )
+        } else {
+            (audio.smooth_bass, audio.smooth_amplitude, audio.smooth_beat)
+        };
 
         // Initialize particles into rings if needed
         if !self.death_spiral_initialized || self.particles.is_empty() {
@@ -651,9 +886,9 @@ impl ParticleEngine {
         }
 
         // Audio-reactive parameters
-        let audio_speed_mult = 1.0 + audio.smooth_bass * spiral_config.audio_speed_influence;
-        let audio_radius_mult = 1.0 + audio.smooth_amplitude * spiral_config.audio_radius_influence;
-        let beat_pulse = 1.0 + audio.smooth_beat * spiral_config.beat_pulse_strength;
+        let audio_speed_mult = 1.0 + eff_bass * spiral_config.audio_speed_influence;
+        let audio_radius_mult = 1.0 + eff_amp * spiral_config.audio_radius_influence;
+        let beat_pulse = 1.0 + eff_beat * spiral_config.beat_pulse_strength;
 
         let ring_count = spiral_config.ring_count.max(1);
         let particles_total = self.particles.len();
@@ -663,109 +898,118 @@ impl ParticleEngine {
         let width = self.width;
         let height = self.height;
 
-        self.particles.par_iter_mut().enumerate().for_each(|(idx, p)| {
-            // Determine ring and position in ring
-            let ring_idx = if particles_per_ring > 0 {
-                (idx / particles_per_ring).min(ring_count - 1)
-            } else {
-                0
-            };
-            let position_in_ring = if particles_per_ring > 0 {
-                (idx % particles_per_ring) as f32 / particles_per_ring.max(1) as f32
-            } else {
-                idx as f32 / particles_total.max(1) as f32
-            };
+        self.particles
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(idx, p)| {
+                // Determine ring and position in ring
+                let ring_idx = if particles_per_ring > 0 {
+                    (idx / particles_per_ring).min(ring_count - 1)
+                } else {
+                    0
+                };
+                let position_in_ring = if particles_per_ring > 0 {
+                    (idx % particles_per_ring) as f32 / particles_per_ring.max(1) as f32
+                } else {
+                    idx as f32 / particles_total.max(1) as f32
+                };
 
-            // Store ring info on particle
-            // Note: We can't modify these in parallel, so we use computed values
+                // Store ring info on particle
+                // Note: We can't modify these in parallel, so we use computed values
 
-            // Base radius for this ring (exponential spacing)
-            let base_radius = spiral_config.inner_radius
-                * spiral_config.ring_spacing.powf(ring_idx as f32)
-                * audio_radius_mult;
+                // Base radius for this ring (exponential spacing)
+                let base_radius = spiral_config.inner_radius
+                    * spiral_config.ring_spacing.powf(ring_idx as f32)
+                    * audio_radius_mult;
 
-            // Scale radius to fit screen
-            let max_radius = (width.min(height) / 2.0) * 0.85;
-            let scaled_radius = base_radius.min(max_radius);
+                // Scale radius to fit screen
+                let max_radius = (width.min(height) / 2.0) * 0.85;
+                let scaled_radius = base_radius.min(max_radius);
 
-            // Direction: alternate for visual effect
-            let direction = if spiral_config.alternate_direction && ring_idx % 2 == 1 {
-                -1.0
-            } else {
-                1.0
-            };
+                // Direction: alternate for visual effect
+                let direction = if spiral_config.alternate_direction && ring_idx % 2 == 1 {
+                    -1.0
+                } else {
+                    1.0
+                };
 
-            // Speed: inner rings spin faster
-            let ring_speed = spiral_config.base_rotation_speed
-                * (1.0 + 0.3 * (ring_count - ring_idx) as f32)
-                * audio_speed_mult
-                * direction;
+                // Speed: inner rings spin faster
+                let ring_speed = spiral_config.base_rotation_speed
+                    * (1.0 + 0.3 * (ring_count - ring_idx) as f32)
+                    * audio_speed_mult
+                    * direction;
 
-            // Base angle + rotation from time
-            let base_angle = position_in_ring * PI * 2.0;
-            let rotated_angle = base_angle + time * ring_speed;
+                // Base angle + rotation from time
+                let base_angle = position_in_ring * PI * 2.0;
+                let rotated_angle = base_angle + time * ring_speed;
 
-            // Wave distortion for organic breathing effect
-            let wave_offset = (rotated_angle * spiral_config.wave_frequency + time * 2.0).sin()
-                * spiral_config.wave_amplitude
-                * scaled_radius;
+                // Wave distortion for organic breathing effect
+                let wave_offset = (rotated_angle * spiral_config.wave_frequency + time * 2.0).sin()
+                    * spiral_config.wave_amplitude
+                    * scaled_radius;
 
-            // Spiral tightness (inward/outward spiral motion)
-            let spiral_offset = position_in_ring * spiral_config.spiral_tightness
-                * scaled_radius * 0.5;
+                // Spiral tightness (inward/outward spiral motion)
+                let spiral_offset =
+                    position_in_ring * spiral_config.spiral_tightness * scaled_radius * 0.5;
 
-            // Final radius with beat pulse
-            let final_radius = (scaled_radius + wave_offset + spiral_offset) * beat_pulse;
+                // Final radius with beat pulse
+                let final_radius = (scaled_radius + wave_offset + spiral_offset) * beat_pulse;
 
-            // Target position
-            let target_x = center.x + rotated_angle.cos() * final_radius;
-            let target_y = center.y + rotated_angle.sin() * final_radius;
-            let target = Vec2::new(target_x, target_y);
+                // Target position
+                let target_x = center.x + rotated_angle.cos() * final_radius;
+                let target_y = center.y + rotated_angle.sin() * final_radius;
+                let target = Vec2::new(target_x, target_y);
 
-            // Follow behavior - particle moves toward target with inertia
-            let to_target = target - p.pos;
-            let follow_force = spiral_config.follow_strength * (1.0 + audio.smooth_mid * 0.5);
+                // Follow behavior - particle moves toward target with inertia
+                let to_target = target - p.pos;
+                let follow_force = spiral_config.follow_strength * (1.0 + audio.smooth_mid * 0.5);
 
-            p.vel.x += to_target.x * follow_force * speed_factor;
-            p.vel.y += to_target.y * follow_force * speed_factor;
+                p.vel.x += to_target.x * follow_force * speed_factor;
+                p.vel.y += to_target.y * follow_force * speed_factor;
 
-            // Strong damping for smooth motion
-            p.vel *= 0.92;
+                // Strong damping for smooth motion
+                p.vel *= 0.92;
 
-            // Clamp velocity to prevent chaos
-            let vel_mag = (p.vel.x * p.vel.x + p.vel.y * p.vel.y).sqrt();
-            let max_vel = 8.0 * audio_speed_mult;
-            if vel_mag > max_vel {
-                let scale = max_vel / vel_mag;
-                p.vel.x *= scale;
-                p.vel.y *= scale;
-            }
+                // Clamp velocity to prevent chaos
+                let vel_mag = (p.vel.x * p.vel.x + p.vel.y * p.vel.y).sqrt();
+                let max_vel = 8.0 * audio_speed_mult;
+                if vel_mag > max_vel {
+                    let scale = max_vel / vel_mag;
+                    p.vel.x *= scale;
+                    p.vel.y *= scale;
+                }
 
-            // Angular velocity synced with ring
-            p.angular_vel = ring_speed * 0.5;
+                // Angular velocity synced with ring
+                p.angular_vel = ring_speed * 0.5;
 
-            // Size pulses with beat, outer rings slightly larger
-            let ring_size_mult = 1.0 + ring_idx as f32 * 0.1;
-            p.size = p.base_size * beat_pulse * ring_size_mult;
+                // Size pulses with beat, outer rings slightly larger
+                let ring_size_mult = 1.0 + ring_idx as f32 * 0.1;
+                p.size = p.base_size * beat_pulse * ring_size_mult;
 
-            // Brightness based on audio
-            p.brightness = 0.7 + audio.smooth_amplitude * 0.3 + audio.smooth_beat * 0.2;
+                // Brightness based on audio
+                p.brightness = 0.7 + audio.smooth_amplitude * 0.3 + audio.smooth_beat * 0.2;
 
-            // Keep audio_alpha high for visibility
-            if p.audio_alpha < 0.8 {
-                p.audio_alpha += dt * 2.0;
-            }
-            p.audio_alpha = p.audio_alpha.min(1.0);
-        });
+                // Keep audio_alpha high for visibility
+                if p.audio_alpha < 0.8 {
+                    p.audio_alpha += dt * 2.0;
+                }
+                p.audio_alpha = p.audio_alpha.min(1.0);
+            });
     }
 
     /// Initialize particles into death spiral formation
-    fn initialize_death_spiral(&mut self, config: &ParticleConfig, spiral_config: &DeathSpiralConfig) {
+    fn initialize_death_spiral(
+        &mut self,
+        config: &ParticleConfig,
+        spiral_config: &DeathSpiralConfig,
+    ) {
         let center = Vec2::new(self.width / 2.0, self.height / 2.0);
         let ring_count = spiral_config.ring_count.max(1);
 
         // Ensure we have enough particles
-        let target_count = config.count.max(ring_count * spiral_config.particles_per_ring);
+        let target_count = config
+            .count
+            .max(ring_count * spiral_config.particles_per_ring);
 
         let mut rng = rand::thread_rng();
 
@@ -780,8 +1024,8 @@ impl ParticleEngine {
                 target_count - self.particles.len()
             };
 
-            let base_radius = spiral_config.inner_radius
-                * spiral_config.ring_spacing.powf(ring_idx as f32);
+            let base_radius =
+                spiral_config.inner_radius * spiral_config.ring_spacing.powf(ring_idx as f32);
 
             let max_radius = (self.width.min(self.height) / 2.0) * 0.85;
             let scaled_radius = base_radius.min(max_radius);
@@ -796,7 +1040,8 @@ impl ParticleEngine {
                 );
 
                 let color_idx = rng.gen_range(0..self.palette.len());
-                let base_size = config.min_size + rng.gen::<f32>() * (config.max_size - config.min_size);
+                let base_size =
+                    config.min_size + rng.gen::<f32>() * (config.max_size - config.min_size);
 
                 let particle = Particle {
                     pos,
@@ -826,63 +1071,91 @@ impl ParticleEngine {
         self.death_spiral_initialized = false;
     }
 
-    /// Find connections between nearby particles using spatial hashing
-    pub fn find_connections(&self, config: &ConnectionConfig) -> Vec<Connection> {
+    pub fn find_connections(
+        &mut self,
+        config: &ConnectionConfig,
+        audio: &AudioState,
+    ) -> Vec<Connection> {
         if !config.enabled {
             return Vec::new();
         }
 
         let mut connections = Vec::new();
-        let cell_size = config.max_distance;
 
-        // Spatial hashing for O(n) instead of O(n²)
-        let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        // Effective max distance based on strict audio reactivity
+        // If audio_reactive is ON, distance scales with volume. Silence = no connections.
+        let audio_scale = if config.audio_reactive {
+            // Map 0.0-1.0 amplitude to 0.1-1.2 scale (keep minimum 10% distance to avoid total collapse, or 0? User asked for strict)
+            // User said "completely not under music... even when turned off". So strict 0 at 0 is better.
+            audio.smooth_amplitude.clamp(0.0, 1.0) * 1.5
+        } else {
+            1.0
+        };
 
-        for (i, p) in self.particles.iter().enumerate() {
-            if p.audio_alpha < 0.1 {
-                continue;
-            }
-            let cell_x = (p.pos.x / cell_size) as i32;
-            let cell_y = (p.pos.y / cell_size) as i32;
-            grid.entry((cell_x, cell_y)).or_default().push(i);
+        // Don't calculate if scale is effectively zero (silence)
+        if config.audio_reactive && audio_scale < 0.05 {
+            return Vec::new();
         }
 
-        // Find neighbors
+        let effective_max_dist = config.max_distance * audio_scale;
+        let max_dist_sq = effective_max_dist * effective_max_dist;
+
+        // Note: Grid is now built in update() to serve both Connections and Repulsion safely.
+
+        // Track density to limit connections per area
+        let mut connection_density: HashMap<(i32, i32), f32> = HashMap::new();
+        let density_cell_size = 20.0; // Fixed size for density check
+
+        // Find connections
         for (i, p) in self.particles.iter().enumerate() {
-            if p.audio_alpha < 0.1 {
+            if p.audio_alpha < config.min_particle_alpha {
                 continue;
             }
 
-            let cell_x = (p.pos.x / cell_size) as i32;
-            let cell_y = (p.pos.y / cell_size) as i32;
-
+            // Query using the BASE config distance (grid was built with this in mind)
+            let neighbors = self.spatial_grid.query_radius(p.pos, config.max_distance);
             let mut particle_connections = 0;
 
-            // Check neighboring cells
-            for dx in -1..=1 {
-                for dy in -1..=1 {
-                    if let Some(neighbors) = grid.get(&(cell_x + dx, cell_y + dy)) {
-                        for &j in neighbors {
-                            if j <= i || particle_connections >= config.max_connections {
-                                continue;
-                            }
+            for &j in &neighbors {
+                if j <= i || particle_connections >= config.max_connections {
+                    continue;
+                }
 
-                            let other = &self.particles[j];
-                            let dist_sq = (p.pos.x - other.pos.x).powi(2)
-                                + (p.pos.y - other.pos.y).powi(2);
-                            let max_dist_sq = config.max_distance.powi(2);
+                let p2 = &self.particles[j];
 
-                            if dist_sq < max_dist_sq {
-                                let strength = 1.0 - (dist_sq / max_dist_sq).sqrt();
-                                connections.push(Connection {
-                                    particle_a: i,
-                                    particle_b: j,
-                                    strength,
-                                });
-                                particle_connections += 1;
-                            }
-                        }
+                // IMPORTANT: Since grid now contains ALL particles (for repulsion),
+                // we must manually skip invisible particles for connections
+                if p2.audio_alpha < config.min_particle_alpha {
+                    continue;
+                }
+
+                let dx = p.pos.x - p2.pos.x;
+                let dy = p.pos.y - p2.pos.y;
+                let dist_sq = dx * dx + dy * dy;
+
+                if dist_sq < max_dist_sq {
+                    // Density check
+                    let cell = (
+                        (p.pos.x / density_cell_size) as i32,
+                        (p.pos.y / density_cell_size) as i32,
+                    );
+                    let cell_density = connection_density.get(&cell).copied().unwrap_or(0.0);
+
+                    if cell_density > config.density_limit {
+                        continue;
                     }
+
+                    // Strength relative to the EFFECTIVE distance
+                    let strength = 1.0 - (dist_sq.sqrt() / effective_max_dist);
+
+                    connections.push(Connection {
+                        particle_a: i,
+                        particle_b: j,
+                        strength,
+                    });
+
+                    *connection_density.entry(cell).or_insert(0.0) += 1.0;
+                    particle_connections += 1;
                 }
             }
         }
@@ -890,7 +1163,7 @@ impl ParticleEngine {
         connections
     }
 
-    /// Render connections between particles
+    /// Render connections between particles (using cached)
     pub fn render_connections(
         &self,
         painter: &Painter,
@@ -902,14 +1175,19 @@ impl ParticleEngine {
             return;
         }
 
-        let connections = self.find_connections(config);
+        // Strict audio reactivity for opacity too
         let audio_mult = if config.audio_reactive {
-            1.0 + audio.smooth_beat * 0.5
+            // Silence = 0 opacity. Max volume = 1.0 (or slightly boosted)
+            audio.smooth_amplitude.clamp(0.0, 1.0) * 1.2
         } else {
             1.0
         };
 
-        for conn in connections {
+        if config.audio_reactive && audio_mult < 0.05 {
+            return;
+        }
+
+        for conn in &self.connections {
             if conn.particle_a >= self.particles.len() || conn.particle_b >= self.particles.len() {
                 continue;
             }
@@ -919,6 +1197,13 @@ impl ParticleEngine {
 
             let pos_a = rect.min + p_a.pos;
             let pos_b = rect.min + p_b.pos;
+
+            // SAFETY CHECK: If wrap occurred, distance will be large. Don't draw line across screen.
+            let dx = (p_a.pos.x - p_b.pos.x).abs();
+            let dy = (p_a.pos.y - p_b.pos.y).abs();
+            if dx > config.max_distance * 1.5 || dy > config.max_distance * 1.5 {
+                continue;
+            }
 
             let alpha = (conn.strength * config.opacity * audio_mult * 255.0) as u8;
             if alpha < 2 {
@@ -932,15 +1217,15 @@ impl ParticleEngine {
                 let b = ((p_a.color.b() as u16 + p_b.color.b() as u16) / 2) as u8;
                 Color32::from_rgba_premultiplied(r, g, b, alpha)
             } else {
-                Color32::from_rgba_premultiplied(
-                    p_a.color.r(),
-                    p_a.color.g(),
-                    p_a.color.b(),
-                    alpha,
-                )
+                Color32::from_rgba_premultiplied(p_a.color.r(), p_a.color.g(), p_a.color.b(), alpha)
             };
 
-            let thickness = config.thickness * conn.strength * audio_mult;
+            let thickness = if config.fade_by_distance {
+                config.thickness * conn.strength * audio_mult
+            } else {
+                config.thickness * audio_mult
+            };
+
             painter.line_segment([pos_a, pos_b], Stroke::new(thickness.max(0.5), color));
         }
     }
@@ -951,7 +1236,13 @@ impl ParticleEngine {
     }
 
     /// Render trails
-    pub fn render_trails(&self, painter: &Painter, rect: Rect, config: &TrailConfig, audio: &AudioState) {
+    pub fn render_trails(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        config: &TrailConfig,
+        audio: &AudioState,
+    ) {
         self.trail_system.render(painter, rect, config, audio);
     }
 
@@ -1056,12 +1347,36 @@ impl ParticleEngine {
         rect: Rect,
         config: &ParticleConfig,
         audio: &AudioState,
+        normalized: Option<&NormalizedAudio>,
     ) {
         if !config.enabled {
             return;
         }
 
-        for p in &self.particles {
+        // Resolve effective amplitude for global size check
+        let eff_amp = if config.adaptive_audio_enabled {
+            normalized.map(|n| n.intensity).unwrap_or(audio.amplitude)
+        } else {
+            audio.amplitude
+        };
+
+        // Depth Sort: Create indices and sort by brightness/alpha if enabled
+        let mut indices: Vec<usize> = (0..self.particles.len()).collect();
+        if config.depth_sort_enabled {
+            indices.sort_by(|&a, &b| {
+                let pa = &self.particles[a];
+                let pb = &self.particles[b];
+                // Sort by brightness (visual importance)
+                let val_a = pa.audio_alpha * pa.brightness * pa.size;
+                let val_b = pb.audio_alpha * pb.brightness * pb.size;
+                val_a
+                    .partial_cmp(&val_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        for &i in &indices {
+            let p = &self.particles[i];
             // Use audio_alpha for audio-reactive visibility
             let life_alpha = (p.life / p.max_life).clamp(0.0, 1.0);
             let audio_factor = if config.audio_reactive_spawn {
@@ -1081,7 +1396,7 @@ impl ParticleEngine {
             let color =
                 Color32::from_rgba_premultiplied(p.color.r(), p.color.g(), p.color.b(), alpha);
 
-            let size = p.size * (1.0 + audio.amplitude * 0.2);
+            let size = p.size * (1.0 + eff_amp * 0.2);
 
             // Render based on shape
             match config.shape {
@@ -1289,49 +1604,44 @@ impl ParticleEngine {
         base_alpha: u8,
         config: &ParticleConfig,
     ) {
-        let steps = config.volumetric_steps.clamp(8, 48) as usize;
-        let intensity = config.glow_intensity.clamp(0.1, 1.0);
-        // Reduced alpha multiplier to prevent oversaturation when many particles overlap
-        let alpha_f32 = base_alpha as f32 * intensity * 0.6;
+        let base_radius = size;
+        let glow_radius = base_radius * (1.0 + config.glow_intensity * 2.0);
+        let steps = config.volumetric_steps.clamp(8, 24) as usize; // Reduced steps for optimization
 
-        // Draw from outside in for proper layering
+        // Proper gaussian falloff bloom
         for i in (0..steps).rev() {
-            let t = i as f32 / steps as f32;
+            let t = i as f32 / steps as f32; // 0.0 to 1.0 (center to edge)
+            let radius = base_radius + (glow_radius - base_radius) * t;
 
-            // Radius goes from size * 1.5 (outer) to size * 0.1 (center)
-            let radius = size * (0.1 + t * 1.4);
+            // Normalized distance for gaussian calculation
+            let dist_norm = t;
 
-            // Gaussian falloff for smooth gradient: exp(-3 * t^2)
-            let gaussian = (-3.0 * t * t).exp();
+            // Gaussian: exp(-k * x^2)
+            let falloff = (-2.5 * dist_norm * dist_norm).exp();
 
-            // Reduced center brightness boost to prevent white blob
-            let center_boost = if t < 0.3 { 1.0 + (0.3 - t) * 0.8 } else { 1.0 };
+            // Intensity boost at core
+            let intensity = if t < 0.2 { 1.5 } else { 1.0 };
 
-            let alpha = (alpha_f32 * gaussian * center_boost * 0.5) as u8;
+            let alpha_f = base_alpha as f32 * falloff * intensity * (1.0 / steps as f32) * 2.0;
+            let alpha = alpha_f.min(255.0) as u8;
 
             if alpha < 1 {
                 continue;
             }
 
-            // Slight brightening towards center (reduced)
-            let brightness = (1.0 + (1.0 - t) * 0.15).min(1.3);
-            let r = ((base_color.r() as f32 * brightness) as u8).min(255);
-            let g = ((base_color.g() as f32 * brightness) as u8).min(255);
-            let b = ((base_color.b() as f32 * brightness) as u8).min(255);
+            let color = Color32::from_rgba_premultiplied(
+                base_color.r(),
+                base_color.g(),
+                base_color.b(),
+                alpha,
+            );
 
-            let layer_color = Color32::from_rgba_premultiplied(r, g, b, alpha);
-            painter.circle_filled(pos, radius, layer_color);
+            painter.circle_filled(pos, radius, color);
         }
 
-        // Subtle center highlight (reduced from +50 to +15 RGB)
-        let center_alpha = (alpha_f32 * 0.5) as u8;
-        if center_alpha > 15 {
-            let r = (base_color.r() as u16 + 15).min(255) as u8;
-            let g = (base_color.g() as u16 + 15).min(255) as u8;
-            let b = (base_color.b() as u16 + 15).min(255) as u8;
-            let center_color = Color32::from_rgba_premultiplied(r, g, b, center_alpha);
-            painter.circle_filled(pos, size * 0.1, center_color);
-        }
+        // Hot core
+        let core_color = Color32::from_rgba_premultiplied(255, 255, 255, 200);
+        painter.circle_filled(pos, size * 0.2, core_color);
     }
 
     /// Get iterator over particles for external rendering

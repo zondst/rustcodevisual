@@ -83,6 +83,9 @@ struct ParticleStudioApp {
     detected_encoder: gpu_export::HardwareEncoder,
     gpu_export_fps: f32,
     gpu_export_progress_rx: Option<std::sync::mpsc::Receiver<gpu_export::GpuExportMessage>>,
+
+    // Status message (text, time_added)
+    status_message: Option<(String, std::time::Instant)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -172,6 +175,7 @@ impl ParticleStudioApp {
             detected_encoder: gpu_export::HardwareEncoder::detect(),
             gpu_export_fps: 0.0,
             gpu_export_progress_rx: None,
+            status_message: None,
         }
     }
 
@@ -275,7 +279,9 @@ impl eframe::App for ParticleStudioApp {
 
                 if let Some(ref analysis) = self.audio_sys.analysis {
                     // Sync frame to time
-                    self.current_frame = (elapsed * analysis.fps as f32) as usize;
+                    let latency_secs = self.config.audio.latency_ms / 1000.0;
+                    let adjusted_time = (elapsed - latency_secs).max(0.0);
+                    self.current_frame = (adjusted_time * analysis.fps as f32) as usize;
 
                     if self.current_frame < analysis.total_frames {
                         let frame = analysis.get_frame(self.current_frame);
@@ -419,6 +425,14 @@ impl ParticleStudioApp {
                     let fps = 1.0 / self.last_dt.max(0.001);
                     ui.label(format!("FPS: {:.0}", fps));
 
+                    // Status Message display
+                    if let Some((ref msg, time)) = self.status_message {
+                        if time.elapsed().as_secs() < 5 {
+                            ui.separator();
+                            ui.colored_label(egui::Color32::LIGHT_BLUE, msg);
+                        }
+                    }
+
                     // Audio info
                     if let Some(ref analysis) = self.audio_sys.analysis {
                         let progress = self.current_frame as f32 / analysis.total_frames as f32;
@@ -483,6 +497,53 @@ impl ParticleStudioApp {
                                 }
                             }
                         });
+                });
+
+                ui.separator();
+
+                // Config Load/Save
+                ui.horizontal(|ui| {
+                    if ui.button("📂 Load Config").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Config", &["json"])
+                            .pick_file()
+                        {
+                            match AppConfig::load(&path.to_string_lossy()) {
+                                Ok(loaded) => {
+                                    self.config = loaded;
+                                    self.particles
+                                        .update_palette(&self.config.get_color_scheme());
+                                    // Reset other systems if needed
+                                    if self.config.particles.adaptive_audio_enabled {
+                                        self.audio_normalizer.reset();
+                                    }
+                                    println!("Config loaded successfully!");
+                                    self.status_message = Some((
+                                        "Config loaded successfully!".to_string(),
+                                        Instant::now(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to load config: {}", e);
+                                    self.status_message = Some((
+                                        format!("Failed to load config: {}", e),
+                                        Instant::now(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    if ui.button("💾 Save Config").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Config", &["json"])
+                            .save_file()
+                        {
+                            if let Err(e) = self.config.save(&path.to_string_lossy()) {
+                                eprintln!("Failed to save config: {}", e);
+                            }
+                        }
+                    }
                 });
 
                 ui.separator();
@@ -697,11 +758,15 @@ impl ParticleStudioApp {
         });
         ui.horizontal(|ui| {
             let was_spiral = self.config.particles.mode == ParticleMode::DeathSpiral;
-            if ui.selectable_value(
-                &mut self.config.particles.mode,
-                ParticleMode::DeathSpiral,
-                "🐜 Death Spiral",
-            ).changed() && !was_spiral {
+            if ui
+                .selectable_value(
+                    &mut self.config.particles.mode,
+                    ParticleMode::DeathSpiral,
+                    "🐜 Death Spiral",
+                )
+                .changed()
+                && !was_spiral
+            {
                 // Reset spiral when entering mode
                 self.particles.reset_death_spiral();
             }
@@ -767,10 +832,13 @@ impl ParticleStudioApp {
             ui.heading("🐜 Death Spiral Settings");
 
             ui.label("Ring Count");
-            if ui.add(egui::Slider::new(
-                &mut self.config.death_spiral.ring_count,
-                2..=10,
-            )).changed() {
+            if ui
+                .add(egui::Slider::new(
+                    &mut self.config.death_spiral.ring_count,
+                    2..=10,
+                ))
+                .changed()
+            {
                 self.particles.reset_death_spiral();
             }
 
@@ -915,8 +983,14 @@ impl ParticleStudioApp {
                 0.5..=5.0,
             ));
 
-            ui.checkbox(&mut self.config.connections.audio_reactive, "Audio Reactive");
-            ui.checkbox(&mut self.config.connections.gradient_enabled, "Color Gradient");
+            ui.checkbox(
+                &mut self.config.connections.audio_reactive,
+                "Audio Reactive",
+            );
+            ui.checkbox(
+                &mut self.config.connections.gradient_enabled,
+                "Color Gradient",
+            );
         }
     }
 
@@ -926,6 +1000,12 @@ impl ParticleStudioApp {
             &mut self.config.audio.smoothing,
             0.0..=0.99,
         ));
+
+        ui.label("Audio Latency (ms)");
+        ui.add(
+            egui::Slider::new(&mut self.config.audio.latency_ms, -500.0..=500.0)
+                .text("Sync Offset"),
+        );
 
         ui.label("Beat Sensitivity");
         ui.add(egui::Slider::new(
@@ -1528,31 +1608,30 @@ impl ParticleStudioApp {
             self.waveform.resize(rect.width(), rect.height());
 
             // Update particles based on mode
-            let speed_factor = self.config.particles.speed * 60.0 * dt;
+            let _speed_factor = self.config.particles.speed * 60.0 * dt;
 
-            if self.config.particles.mode == ParticleMode::DeathSpiral {
-                // Use specialized Death Spiral update
-                self.particles.update_death_spiral(
-                    &self.config.particles,
-                    &self.config.death_spiral,
-                    &self.audio_state,
-                    dt,
-                    speed_factor,
-                );
+            // Create normalized audio ref once
+            let normalized_ref = if self.config.particles.adaptive_audio_enabled {
+                Some(&self.normalized_audio)
             } else {
-                // Standard particle update for other modes
-                let normalized_ref = if self.config.particles.adaptive_audio_enabled {
-                    Some(&self.normalized_audio)
-                } else {
-                    None
-                };
-                self.particles.update(
-                    &self.config.particles,
-                    &self.audio_state,
-                    dt,
-                    normalized_ref,
-                );
-            }
+                None
+            };
+
+            // Pass Death Spiral config if relevant (or always, as Option)
+            let death_spiral_config = if self.config.particles.mode == ParticleMode::DeathSpiral {
+                Some(&self.config.death_spiral)
+            } else {
+                None
+            };
+
+            self.particles.update(
+                &self.config.particles,
+                &self.config.connections,
+                death_spiral_config,
+                &self.audio_state,
+                dt,
+                normalized_ref,
+            );
 
             // Update trails
             self.particles.update_trails(&self.config.trails, dt);
@@ -1587,14 +1666,25 @@ impl ParticleStudioApp {
             );
 
             // Draw trails (behind particles)
-            self.particles.render_trails(&painter, rect, &self.config.trails, &self.audio_state);
+            self.particles
+                .render_trails(&painter, rect, &self.config.trails, &self.audio_state);
 
             // Draw connections (behind particles)
-            self.particles.render_connections(&painter, rect, &self.config.connections, &self.audio_state);
+            self.particles.render_connections(
+                &painter,
+                rect,
+                &self.config.connections,
+                &self.audio_state,
+            );
 
             // Draw particles
-            self.particles
-                .render(&painter, rect, &self.config.particles, &self.audio_state);
+            self.particles.render(
+                &painter,
+                rect,
+                &self.config.particles,
+                &self.audio_state,
+                normalized_ref,
+            );
 
             // Audio level indicators (conditionally)
             if self.config.visual.show_audio_meters {
@@ -1603,7 +1693,7 @@ impl ParticleStudioApp {
         });
     }
 
-    fn draw_audio_meters(&self, ui: &egui::Ui, rect: egui::Rect, painter: &egui::Painter) {
+    fn draw_audio_meters(&self, _ui: &egui::Ui, rect: egui::Rect, painter: &egui::Painter) {
         let meter_width = 8.0;
         let meter_height = 100.0;
         let margin = 10.0;

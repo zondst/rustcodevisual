@@ -64,7 +64,6 @@ impl PostProcessor {
         let mut mask = vec![1.0f32; (width * height) as usize];
         let cx = width as f32 / 2.0;
         let cy = height as f32 / 2.0;
-        let max_dist = (cx * cx + cy * cy).sqrt();
 
         for y in 0..height {
             for x in 0..width {
@@ -532,7 +531,7 @@ impl PostProcessor {
         self.prev_frame = Some(buffer.clone());
     }
 
-    fn apply_vignette(&self, buffer: &mut Vec<[f32; 3]>, width: u32, height: u32, strength: f32) {
+    fn apply_vignette(&self, buffer: &mut Vec<[f32; 3]>, _width: u32, _height: u32, strength: f32) {
         for (i, pixel) in buffer.iter_mut().enumerate() {
             let mask_val = self.vignette_mask.get(i).copied().unwrap_or(1.0);
             let factor = 1.0 - (1.0 - mask_val) * strength;
