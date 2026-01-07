@@ -86,7 +86,7 @@ impl HardwareEncoder {
         }
     }
 
-    /// Get encoder-specific options (quality-aware).
+    /// Get encoder-specific options (quality-aware, GPU-optimized).
     ///
     /// `quality` is treated as CRF/CQ-like value where **lower = higher quality**.
     /// The valid range depends on encoder; we clamp to a safe range and map accordingly.
@@ -94,6 +94,9 @@ impl HardwareEncoder {
     /// NOTE: For hardware encoders (especially NVENC), constant-quality mode still needs a
     /// sensible bitrate ceiling, otherwise you can get **blocky macroblock artifacts**
     /// ("pixelated squares" on particles) even when CQ looks reasonable.
+    ///
+    /// GPU OPTIMIZATION: Uses faster presets (P4/P5) and single-pass encoding to maximize
+    /// GPU utilization. The previous P7+multipass caused GPU to wait on CPU too much.
     pub fn ffmpeg_options(&self, quality: u32, fps: u32, width: u32, height: u32) -> Vec<String> {
         // Most FFmpeg encoders use 0..51-ish quality scales (x264 CRF is commonly 15..30).
         let q = quality.clamp(0, 51);
@@ -120,54 +123,88 @@ impl HardwareEncoder {
         let maxrate_mbps = (target_mbps.saturating_mul(2)).clamp(40, 600);
         let buf_mbps = (target_mbps.saturating_mul(4)).clamp(80, 1200);
 
+        // Choose preset based on resolution for optimal GPU utilization
+        // Higher resolutions benefit from faster presets to keep GPU saturated
+        let is_high_res = width >= 2560 || height >= 1440;
+        let is_4k = width >= 3840 || height >= 2160;
+
         match self {
-            Self::Nvenc => vec![
-                // Quality preset: p7 = best quality (slowest)
-                "-preset".into(), "p7".into(),
-                "-tune".into(), "hq".into(),
+            Self::Nvenc => {
+                // GPU-OPTIMIZED NVENC settings:
+                // - P4/P5 instead of P7 for better GPU utilization (P7 is CPU-bound)
+                // - Single-pass instead of multipass (2x faster, GPU stays busy)
+                // - Lookahead reduced for lower latency
+                let preset = if is_4k { "p4" } else if is_high_res { "p5" } else { "p5" };
+                let lookahead = if is_4k { 16 } else { 24 };
 
-                // Two-pass improves detail retention on particle fields.
-                "-multipass".into(), "fullres".into(),
+                vec![
+                    // Faster preset = higher GPU utilization
+                    "-preset".into(), preset.into(),
+                    "-tune".into(), "hq".into(),
 
-                // Constant-quality VBR HQ
-                "-rc".into(), "vbr_hq".into(),
-                "-cq".into(), q.to_string(),
+                    // Single-pass for speed (multipass is CPU-heavy)
+                    "-multipass".into(), "disabled".into(),
 
-                // IMPORTANT: set an explicit bitrate envelope.
-                "-b:v".into(), format!("{}M", target_mbps),
-                "-maxrate".into(), format!("{}M", maxrate_mbps),
-                "-bufsize".into(), format!("{}M", buf_mbps),
+                    // Constant-quality VBR (good balance of quality and GPU usage)
+                    "-rc".into(), "vbr".into(),
+                    "-cq".into(), q.to_string(),
 
-                // Adaptive quantization helps preserve sparkly detail.
-                "-spatial-aq".into(), "1".into(),
-                "-temporal-aq".into(), "1".into(),
-                "-aq-strength".into(), "12".into(),
+                    // Bitrate envelope prevents quality drops
+                    "-b:v".into(), format!("{}M", target_mbps),
+                    "-maxrate".into(), format!("{}M", maxrate_mbps),
+                    "-bufsize".into(), format!("{}M", buf_mbps),
 
-                "-rc-lookahead".into(), "32".into(),
-                "-bf".into(), "3".into(),
-                "-g".into(), gop.to_string(),
-            ],
+                    // Adaptive quantization (GPU-accelerated on NVENC)
+                    "-spatial-aq".into(), "1".into(),
+                    "-temporal-aq".into(), "1".into(),
+                    "-aq-strength".into(), "10".into(),
+
+                    // Reduced lookahead for faster encoding
+                    "-rc-lookahead".into(), lookahead.to_string(),
+
+                    // B-frames for compression efficiency (GPU handles these well)
+                    "-bf".into(), "3".into(),
+                    "-b_ref_mode".into(), "middle".into(),
+
+                    // GOP size
+                    "-g".into(), gop.to_string(),
+
+                    // GPU surface count for parallel processing
+                    "-surfaces".into(), "32".into(),
+                ]
+            },
             Self::Amf => vec![
-                "-quality".into(), "quality".into(),
+                // AMD VCE/AMF optimized settings
+                "-quality".into(), "balanced".into(), // "quality" is slow, "balanced" uses GPU better
                 "-rc".into(), "vbr_peak".into(),
                 "-qp_i".into(), q.to_string(),
                 "-qp_p".into(), (q.saturating_add(2)).to_string(),
                 "-g".into(), gop.to_string(),
+                // Enable pre-analysis for better quality
+                "-preanalysis".into(), "true".into(),
+                // Use more reference frames
+                "-bf".into(), "3".into(),
             ],
             Self::Qsv => vec![
-                "-preset".into(), "medium".into(),
+                // Intel QuickSync optimized settings
+                "-preset".into(), "faster".into(), // "medium" is slow, "faster" saturates GPU
                 "-global_quality".into(), q.to_string(),
                 "-g".into(), gop.to_string(),
+                // Enable look-ahead for quality
+                "-look_ahead".into(), "1".into(),
+                "-look_ahead_depth".into(), "40".into(),
             ],
             Self::Software => vec![
                 // Software is slower but often gives best quality per bitrate.
-                "-preset".into(), "slow".into(),
+                "-preset".into(), "medium".into(), // "slow" is too CPU-intensive
                 "-crf".into(), q.to_string(),
                 "-g".into(), gop.to_string(),
                 "-keyint_min".into(), gop.to_string(),
                 "-sc_threshold".into(), "0".into(),
                 // Better quality for animated/high-contrast graphics
                 "-tune".into(), "animation".into(),
+                // Use all CPU threads
+                "-threads".into(), "0".into(),
             ],
         }
     }
@@ -269,20 +306,67 @@ fn png_sequence_pattern(output_path: &PathBuf) -> PathBuf {
     parent.join(format!("{}_%06d.png", stem))
 }
 
+/// Check if CUDA hwupload is available for FFmpeg
+fn check_cuda_hwupload_available() -> bool {
+    Command::new("ffmpeg")
+        .args(["-hide_banner", "-filters"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map(|output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.contains("hwupload_cuda")
+        })
+        .unwrap_or(false)
+}
+
+/// Check if AMD AMF hwupload is available
+fn check_amf_hwupload_available() -> bool {
+    Command::new("ffmpeg")
+        .args(["-hide_banner", "-filters"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map(|output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.contains("hwupload_amf") || stdout.contains("hwupload")
+        })
+        .unwrap_or(false)
+}
+
 /// Start FFmpeg process with the selected output format.
+/// Uses GPU hardware upload when available for maximum GPU utilization.
 fn start_ffmpeg(config: &GpuExportConfig) -> Result<Child, String> {
     let mut cmd = Command::new("ffmpeg");
+
+    // Check for hardware upload capability
+    let use_cuda_upload = config.encoder == HardwareEncoder::Nvenc && check_cuda_hwupload_available();
+    let use_amf_upload = config.encoder == HardwareEncoder::Amf && check_amf_hwupload_available();
 
     // Disable interactive mode, keep output minimal (we'll drain stderr separately).
     cmd.arg("-y")
         .arg("-nostdin")
         .arg("-loglevel").arg("error")
-        .arg("-vsync").arg("cfr")
-        // Raw RGBA frames from GPU
-        .arg("-f").arg("rawvideo")
+        .arg("-vsync").arg("cfr");
+
+    // Initialize hardware device for GPU upload (NVIDIA CUDA)
+    if use_cuda_upload {
+        cmd.args(["-init_hw_device", "cuda=cu:0"]);
+        cmd.args(["-filter_hw_device", "cu"]);
+    }
+
+    // Initialize hardware device for AMD
+    if use_amf_upload {
+        cmd.args(["-init_hw_device", "d3d11va=hw"]);
+        cmd.args(["-filter_hw_device", "hw"]);
+    }
+
+    // Raw RGBA frames from GPU renderer
+    cmd.arg("-f").arg("rawvideo")
         .arg("-pix_fmt").arg("rgba")
         .arg("-s").arg(format!("{}x{}", config.width, config.height))
         .arg("-r").arg(config.fps.to_string())
+        .arg("-thread_queue_size").arg("1024") // Larger input buffer
         .arg("-i").arg("pipe:0");
 
     // Optional audio input (containers only; PNG sequence ignores audio)
@@ -299,10 +383,24 @@ fn start_ffmpeg(config: &GpuExportConfig) -> Result<Child, String> {
             let encoder_name = config.encoder.ffmpeg_encoder();
             let pix_fmt = pick_best_h264_pix_fmt(encoder_name);
 
+            // GPU-accelerated filter chain for hardware upload
+            // This transfers frames directly to GPU memory, bypassing CPU
+            if use_cuda_upload {
+                // CUDA filter chain: convert colorspace on GPU, upload to GPU memory
+                let nv_pix_fmt = if pix_fmt == "yuv444p" { "yuv444p" } else { "nv12" };
+                cmd.args(["-vf", &format!(
+                    "format=rgba,hwupload_cuda,scale_cuda=format={}",
+                    nv_pix_fmt
+                )]);
+            } else if use_amf_upload {
+                // AMD hardware upload
+                cmd.args(["-vf", "format=nv12,hwupload"]);
+            }
+
             // Video encoder
             cmd.arg("-c:v").arg(encoder_name);
 
-            // Encoder options (quality-aware)
+            // Encoder options (quality-aware, GPU-optimized)
             for opt in config
                 .encoder
                 .ffmpeg_options(config.quality, config.fps, config.width, config.height)
@@ -326,9 +424,10 @@ fn start_ffmpeg(config: &GpuExportConfig) -> Result<Child, String> {
                 }
             }
 
-            // IMPORTANT: Do NOT force yuv420p always – it destroys chroma detail.
-            // We choose the best supported format above.
-            cmd.arg("-pix_fmt").arg(&pix_fmt);
+            // Pixel format (for non-hwupload paths)
+            if !use_cuda_upload && !use_amf_upload {
+                cmd.arg("-pix_fmt").arg(&pix_fmt);
+            }
 
             // Audio for MP4
             if config.audio_path.is_some() {
@@ -478,11 +577,14 @@ fn run_gpu_export_impl(
     // Reusable GPU particle upload buffer to avoid per-frame allocations.
     let mut gpu_particles: Vec<GpuParticle> = Vec::with_capacity(config.particles.count.max(1024));
 
-    // 3) Start FFmpeg + writer thread (triple-buffered)
+    // 3) Start FFmpeg + writer thread with deep buffering for GPU saturation
     let ffmpeg = start_ffmpeg(&export_config)?;
 
-    // Create bounded channel for triple-buffering (3 frames in flight)
-    let (frame_tx, frame_rx): (Sender<FrameData>, Receiver<FrameData>) = bounded(3);
+    // GPU-OPTIMIZED: Use 8-frame buffer instead of 3 for better GPU utilization
+    // This allows the render thread to stay ahead of the encoder, keeping GPU busy
+    // Higher resolutions benefit from larger buffers
+    let buffer_depth = if width >= 3840 { 12 } else if width >= 2560 { 10 } else { 8 };
+    let (frame_tx, frame_rx): (Sender<FrameData>, Receiver<FrameData>) = bounded(buffer_depth);
 
     // Spawn FFmpeg writer thread
     let output_path = export_config.output_path.clone();
@@ -513,11 +615,14 @@ fn run_gpu_export_impl(
 
         // Process frames - use scope to ensure stdin borrow ends before take()
         {
-            let stdin = ffmpeg.stdin.as_mut().ok_or("Failed to open FFmpeg stdin")?;
+            let stdin = ffmpeg.stdin.take().ok_or("Failed to open FFmpeg stdin")?;
+            // GPU-OPTIMIZED: Use BufWriter with large buffer (16MB) to reduce syscalls
+            // This significantly improves throughput for high-resolution exports
+            let mut buffered_stdin = std::io::BufWriter::with_capacity(16 * 1024 * 1024, stdin);
 
             for frame in frame_rx {
-                // Write frame to FFmpeg
-                stdin.write_all(&frame.pixels)
+                // Write frame to FFmpeg with buffering
+                buffered_stdin.write_all(&frame.pixels)
                     .map_err(|e| format!("FFmpeg write error: {}", e))?;
 
                 // Send progress updates (from writer thread for accurate encoding progress)
@@ -530,10 +635,11 @@ fn run_gpu_export_impl(
                     last_progress_frame = frame.frame_index;
                 }
             }
-        }
 
-        // CRITICAL FIX: Take ownership of stdin and drop it to signal EOF to FFmpeg
-        drop(ffmpeg.stdin.take());
+            // Flush remaining buffered data before closing
+            buffered_stdin.flush().map_err(|e| format!("FFmpeg flush error: {}", e))?;
+            // Drop buffered_stdin to close the underlying pipe and signal EOF to FFmpeg
+        }
 
         // Wait for FFmpeg to finish with timeout
         let wait_start = std::time::Instant::now();
