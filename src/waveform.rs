@@ -71,7 +71,8 @@ impl WaveformVisualizer {
         let center_y = rect.top() + rect.height() * config.position_y;
         let amplitude = config.amplitude * (1.0 + audio.amplitude * 0.5);
         
-        let color = Color32::from_rgb(colors.waveform[0], colors.waveform[1], colors.waveform[2]);
+        let wave_rgb = if config.use_scheme_color { colors.waveform } else { config.color };
+        let color = Color32::from_rgb(wave_rgb[0], wave_rgb[1], wave_rgb[2]);
         
         let samples = self.smoothed_waveform.len();
         let mut points: Vec<Pos2> = Vec::with_capacity(samples);
@@ -91,7 +92,7 @@ impl WaveformVisualizer {
         
         // Glow effect
         let glow_color = Color32::from_rgba_unmultiplied(
-            colors.waveform[0], colors.waveform[1], colors.waveform[2],
+            wave_rgb[0], wave_rgb[1], wave_rgb[2],
             (audio.amplitude * 80.0) as u8,
         );
         let glow_stroke = egui::Stroke::new(config.thickness * 3.0, glow_color);
@@ -112,7 +113,8 @@ impl WaveformVisualizer {
         let center_y = rect.top() + rect.height() * config.position_y;
         let amplitude = config.amplitude * (1.0 + audio.amplitude * 0.5);
         
-        let color = Color32::from_rgb(colors.waveform[0], colors.waveform[1], colors.waveform[2]);
+        let wave_rgb = if config.use_scheme_color { colors.waveform } else { config.color };
+        let color = Color32::from_rgb(wave_rgb[0], wave_rgb[1], wave_rgb[2]);
         
         // Downsample for bar display
         let bar_count = 64;
@@ -167,7 +169,8 @@ impl WaveformVisualizer {
         let base_radius = rect.width().min(rect.height()) * config.circular_radius;
         let amplitude = config.amplitude * 0.5 * (1.0 + audio.amplitude * 0.5);
         
-        let color = Color32::from_rgb(colors.waveform[0], colors.waveform[1], colors.waveform[2]);
+        let wave_rgb = if config.use_scheme_color { colors.waveform } else { config.color };
+        let color = Color32::from_rgb(wave_rgb[0], wave_rgb[1], wave_rgb[2]);
         
         let samples = self.smoothed_waveform.len();
         let angle_step = std::f32::consts::TAU / samples as f32;
@@ -196,7 +199,7 @@ impl WaveformVisualizer {
         
         // Draw inner circle
         let inner_color = Color32::from_rgba_unmultiplied(
-            colors.waveform[0], colors.waveform[1], colors.waveform[2],
+            wave_rgb[0], wave_rgb[1], wave_rgb[2],
             50,
         );
         painter.circle_stroke(center, base_radius * 0.8, egui::Stroke::new(1.0, inner_color));
@@ -213,7 +216,8 @@ impl WaveformVisualizer {
         let center_y = rect.top() + rect.height() * config.position_y;
         let amplitude = config.amplitude * (1.0 + audio.amplitude * 0.5);
         
-        let color = Color32::from_rgb(colors.waveform[0], colors.waveform[1], colors.waveform[2]);
+        let wave_rgb = if config.use_scheme_color { colors.waveform } else { config.color };
+        let color = Color32::from_rgb(wave_rgb[0], wave_rgb[1], wave_rgb[2]);
         
         let samples = self.smoothed_waveform.len();
         let mut upper_points: Vec<Pos2> = Vec::with_capacity(samples);
@@ -241,7 +245,7 @@ impl WaveformVisualizer {
         
         // Fill between with transparent color
         let fill_color = Color32::from_rgba_unmultiplied(
-            colors.waveform[0], colors.waveform[1], colors.waveform[2],
+            wave_rgb[0], wave_rgb[1], wave_rgb[2],
             30,
         );
         
@@ -256,7 +260,7 @@ impl WaveformVisualizer {
         
         // Center line
         let center_color = Color32::from_rgba_unmultiplied(
-            colors.waveform[0], colors.waveform[1], colors.waveform[2],
+            wave_rgb[0], wave_rgb[1], wave_rgb[2],
             100,
         );
         painter.line_segment(

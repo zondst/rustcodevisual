@@ -4,10 +4,13 @@
 
 use crate::audio::{AudioAnalysis, AudioState};
 use crate::config::AppConfig;
-use crate::gpu_render::{GpuRenderer, GpuParticle, RenderParams, SimParams};
+use crate::gpu_render::{GpuRenderer, GpuParticle, RenderParams};
+use crate::export::ExportFormat;
 use crossbeam_channel::{bounded, Sender, Receiver};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::process::{Command, Stdio, Child};
 use std::sync::mpsc::Sender as MpscSender;
 use std::thread;
@@ -83,39 +86,92 @@ impl HardwareEncoder {
         }
     }
 
-    /// Get encoder-specific options
-    pub fn ffmpeg_options(&self) -> Vec<&'static str> {
+    /// Get encoder-specific options (quality-aware).
+    ///
+    /// `quality` is treated as CRF/CQ-like value where **lower = higher quality**.
+    /// The valid range depends on encoder; we clamp to a safe range and map accordingly.
+    ///
+    /// NOTE: For hardware encoders (especially NVENC), constant-quality mode still needs a
+    /// sensible bitrate ceiling, otherwise you can get **blocky macroblock artifacts**
+    /// ("pixelated squares" on particles) even when CQ looks reasonable.
+    pub fn ffmpeg_options(&self, quality: u32, fps: u32, width: u32, height: u32) -> Vec<String> {
+        // Most FFmpeg encoders use 0..51-ish quality scales (x264 CRF is commonly 15..30).
+        let q = quality.clamp(0, 51);
+        // Reasonable GOP: 2 seconds
+        let gop = (fps.saturating_mul(2)).max(1);
+
+        // Heuristic: animated high-contrast graphics (particles) need much higher bitrate
+        // than typical camera footage to avoid block artifacts.
+        // We compute a bitrate target from pixels/sec and a bpp factor derived from quality.
+        let pixels_per_sec = width as f64 * height as f64 * fps as f64;
+        // Bits-per-pixel heuristic:
+        // - Particle visuals are *hard* for H.264 (lots of tiny high-contrast details).
+        // - We intentionally use a fairly high bpp to avoid macroblocking.
+        let bpp: f64 = match q {
+            0..=12 => 1.30,
+            13..=16 => 1.10,
+            17..=20 => 0.90,
+            21..=28 => 0.70,
+            _ => 0.55,
+        };
+        let target_mbps = ((pixels_per_sec * bpp) / 1_000_000.0).ceil() as u32;
+        // Keep sane bounds so exports don't explode in size.
+        let target_mbps = target_mbps.clamp(20, 400);
+        let maxrate_mbps = (target_mbps.saturating_mul(2)).clamp(40, 600);
+        let buf_mbps = (target_mbps.saturating_mul(4)).clamp(80, 1200);
+
         match self {
             Self::Nvenc => vec![
-                "-preset", "p6",
-                "-tune", "hq",
-                "-rc", "vbr",
-                "-cq", "19",
-                "-b:v", "0",
-                "-maxrate", "80M",
-                "-bufsize", "160M",
-                "-temporal-aq", "1",
-                "-spatial-aq", "1",
-                "-rc-lookahead", "20",
-                "-bf", "3",
-                "-g", "120",
+                // Quality preset: p7 = best quality (slowest)
+                "-preset".into(), "p7".into(),
+                "-tune".into(), "hq".into(),
+
+                // Two-pass improves detail retention on particle fields.
+                "-multipass".into(), "fullres".into(),
+
+                // Constant-quality VBR HQ
+                "-rc".into(), "vbr_hq".into(),
+                "-cq".into(), q.to_string(),
+
+                // IMPORTANT: set an explicit bitrate envelope.
+                "-b:v".into(), format!("{}M", target_mbps),
+                "-maxrate".into(), format!("{}M", maxrate_mbps),
+                "-bufsize".into(), format!("{}M", buf_mbps),
+
+                // Adaptive quantization helps preserve sparkly detail.
+                "-spatial-aq".into(), "1".into(),
+                "-temporal-aq".into(), "1".into(),
+                "-aq-strength".into(), "12".into(),
+
+                "-rc-lookahead".into(), "32".into(),
+                "-bf".into(), "3".into(),
+                "-g".into(), gop.to_string(),
             ],
             Self::Amf => vec![
-                "-quality", "quality",
-                "-rc", "vbr_peak",
-                "-qp_i", "19",
-                "-qp_p", "21",
+                "-quality".into(), "quality".into(),
+                "-rc".into(), "vbr_peak".into(),
+                "-qp_i".into(), q.to_string(),
+                "-qp_p".into(), (q.saturating_add(2)).to_string(),
+                "-g".into(), gop.to_string(),
             ],
             Self::Qsv => vec![
-                "-preset", "medium",
-                "-global_quality", "20",
+                "-preset".into(), "medium".into(),
+                "-global_quality".into(), q.to_string(),
+                "-g".into(), gop.to_string(),
             ],
             Self::Software => vec![
-                "-preset", "medium",
-                "-crf", "18",
+                // Software is slower but often gives best quality per bitrate.
+                "-preset".into(), "slow".into(),
+                "-crf".into(), q.to_string(),
+                "-g".into(), gop.to_string(),
+                "-keyint_min".into(), gop.to_string(),
+                "-sc_threshold".into(), "0".into(),
+                // Better quality for animated/high-contrast graphics
+                "-tune".into(), "animation".into(),
             ],
         }
     }
+
 
     pub fn name(&self) -> &'static str {
         match self {
@@ -132,7 +188,9 @@ pub struct GpuExportConfig {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    pub start_time_secs: f32,
     pub duration_secs: f32,
+    pub format: ExportFormat,
     pub output_path: PathBuf,
     pub audio_path: Option<PathBuf>,
     pub encoder: HardwareEncoder,
@@ -140,57 +198,214 @@ pub struct GpuExportConfig {
     pub quality: u32, // CRF/CQ value (lower = higher quality)
 }
 
-/// Start FFmpeg process with hardware encoding
+
+/// Try to query supported pixel formats for a given FFmpeg encoder.
+/// This lets us pick the best chroma format (420 vs 444) when available.
+fn query_supported_pixel_formats(encoder: &str) -> Vec<String> {
+    // Example: ffmpeg -hide_banner -h encoder=libx264
+    let out = Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-h")
+        .arg(format!("encoder={}", encoder))
+        .output();
+
+    let Ok(out) = out else { return Vec::new(); };
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    let mut formats: Vec<String> = Vec::new();
+    let mut collecting = false;
+
+    for line in text.lines() {
+        if let Some(idx) = line.find("Supported pixel formats:") {
+            collecting = true;
+            let rest = &line[idx + "Supported pixel formats:".len()..];
+            formats.extend(rest.split_whitespace().map(|s| s.to_string()));
+            continue;
+        }
+
+        if collecting {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                break;
+            }
+
+            // Some ffmpeg builds wrap the list on following indented lines.
+            // Stop when we hit another "Supported ..." header.
+            if trimmed.starts_with("Supported ") && trimmed.contains(':') {
+                break;
+            }
+
+            formats.extend(trimmed.split_whitespace().map(|s| s.to_string()));
+        }
+    }
+
+    formats
+}
+
+/// Pick the best YUV pixel format for H.264 output.
+/// Prefer 4:4:4 if supported to preserve sharp neon edges/colors (preview is RGB).
+fn pick_best_h264_pix_fmt(encoder: &str) -> String {
+    let supported = query_supported_pixel_formats(encoder);
+    // Prefer higher chroma fidelity when available
+    for fmt in ["yuv444p", "yuv422p", "yuv420p"].iter() {
+        if supported.iter().any(|f| f == fmt) {
+            return (*fmt).to_string();
+        }
+    }
+    // Fallback
+    "yuv420p".to_string()
+}
+
+/// Build a PNG sequence output pattern from a single file path.
+///
+/// input:  /path/out.png
+/// output: /path/out_%06d.png
+fn png_sequence_pattern(output_path: &PathBuf) -> PathBuf {
+    let parent = output_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = output_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("frame");
+    parent.join(format!("{}_%06d.png", stem))
+}
+
+/// Start FFmpeg process with the selected output format.
 fn start_ffmpeg(config: &GpuExportConfig) -> Result<Child, String> {
     let mut cmd = Command::new("ffmpeg");
 
-    // CRITICAL: Disable interactive mode and minimize stderr output
-    // This prevents the 99% hang issue caused by stderr buffer filling up
+    // Disable interactive mode, keep output minimal (we'll drain stderr separately).
     cmd.arg("-y")
-       .arg("-nostdin")           // Disable interactive mode
-       .arg("-loglevel").arg("error")  // Only show errors, reduce stderr output
-       .arg("-vsync").arg("cfr")
-       .arg("-f").arg("rawvideo")
-       .arg("-pix_fmt").arg("rgba")
-       .arg("-s").arg(format!("{}x{}", config.width, config.height))
-       .arg("-r").arg(config.fps.to_string())
-       .arg("-i").arg("pipe:0");
+        .arg("-nostdin")
+        .arg("-loglevel").arg("error")
+        .arg("-vsync").arg("cfr")
+        // Raw RGBA frames from GPU
+        .arg("-f").arg("rawvideo")
+        .arg("-pix_fmt").arg("rgba")
+        .arg("-s").arg(format!("{}x{}", config.width, config.height))
+        .arg("-r").arg(config.fps.to_string())
+        .arg("-i").arg("pipe:0");
 
-    // Add audio input if available
+    // Optional audio input (containers only; PNG sequence ignores audio)
     if let Some(ref audio_path) = config.audio_path {
-        cmd.arg("-i").arg(audio_path);
+        if config.format != ExportFormat::PngSequence {
+            cmd.arg("-i").arg(audio_path);
+            // Explicit stream mapping avoids surprises with containers/codecs
+            cmd.args(["-map", "0:v:0", "-map", "1:a:0", "-shortest"]);
+        }
     }
 
-    // Video filter for pixel format conversion
-    cmd.arg("-vf").arg("format=yuv420p");
+    match config.format {
+        ExportFormat::MP4 => {
+            let encoder_name = config.encoder.ffmpeg_encoder();
+            let pix_fmt = pick_best_h264_pix_fmt(encoder_name);
 
-    // Encoder selection
-    cmd.arg("-c:v").arg(config.encoder.ffmpeg_encoder());
+            // Video encoder
+            cmd.arg("-c:v").arg(encoder_name);
 
-    // Encoder-specific options
-    for opt in config.encoder.ffmpeg_options() {
-        cmd.arg(opt);
+            // Encoder options (quality-aware)
+            for opt in config
+                .encoder
+                .ffmpeg_options(config.quality, config.fps, config.width, config.height)
+            {
+                cmd.arg(opt);
+            }
+
+            // If we ended up using 4:4:4/4:2:2 with libx264, set a matching profile.
+            if encoder_name == "libx264" {
+                if pix_fmt == "yuv444p" {
+                    cmd.args(["-profile:v", "high444"]);
+                } else if pix_fmt == "yuv422p" {
+                    cmd.args(["-profile:v", "high422"]);
+                }
+            } else if encoder_name == "h264_nvenc" {
+                // NVENC requires an explicit profile for 4:4:4 output.
+                if pix_fmt == "yuv444p" {
+                    cmd.args(["-profile:v", "high444p"]);
+                } else {
+                    cmd.args(["-profile:v", "high"]);
+                }
+            }
+
+            // IMPORTANT: Do NOT force yuv420p always – it destroys chroma detail.
+            // We choose the best supported format above.
+            cmd.arg("-pix_fmt").arg(&pix_fmt);
+
+            // Audio for MP4
+            if config.audio_path.is_some() {
+                cmd.args(["-c:a", "aac", "-b:a", "256k"]);
+            }
+
+            // MP4 fast start
+            cmd.args(["-movflags", "+faststart"]);
+
+            // Output file
+            cmd.arg(&config.output_path);
+        }
+
+        ExportFormat::MovAlpha => {
+            // ProRes 4444 with alpha (high quality, editor-friendly).
+            cmd.args(["-c:v", "prores_ks"])
+                .args(["-profile:v", "4"])           // 4 = 4444
+                .args(["-pix_fmt", "yuva444p10le"])
+                .args(["-vendor", "ap10"])
+                .args(["-bits_per_mb", "8000"]);
+
+            // Audio for MOV (keep it high quality for editing)
+            if config.audio_path.is_some() {
+                cmd.args(["-c:a", "pcm_s16le"]);
+            }
+
+            cmd.arg(&config.output_path);
+        }
+
+        ExportFormat::WebM => {
+            // VP9 supports alpha in WebM via yuva420p.
+            cmd.args(["-c:v", "libvpx-vp9"])
+                .args(["-pix_fmt", "yuva420p"])
+                .args(["-b:v", "0"])
+                .args(["-crf", &config.quality.to_string()])
+                .args(["-deadline", "good"])
+                .args(["-cpu-used", "0"])
+                .args(["-row-mt", "1"])
+                .args(["-threads", "8"])
+                // Required for VP9 alpha in many builds
+                .args(["-auto-alt-ref", "0"]);
+
+            if config.audio_path.is_some() {
+                cmd.args(["-c:a", "libopus", "-b:a", "192k"]);
+            }
+
+            cmd.arg(&config.output_path);
+        }
+
+        ExportFormat::PngSequence => {
+            // PNG sequence (with alpha). We ignore audio here.
+            let pattern = png_sequence_pattern(&config.output_path);
+            // Ensure parent folder exists
+            if let Some(parent) = pattern.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+
+            cmd.args(["-f", "image2"])
+                .args(["-start_number", "0"])
+                .args(["-c:v", "png"])
+                // Lower is faster, higher is smaller files.
+                .args(["-compression_level", "3"]);
+
+            cmd.arg(pattern);
+        }
     }
 
-    // Audio encoding (if audio input exists)
-    if config.audio_path.is_some() {
-        cmd.arg("-c:a").arg("aac")
-           .arg("-b:a").arg("256k");
-    }
-
-    // Output optimizations
-    cmd.arg("-movflags").arg("+faststart");
-
-    // Output file
-    cmd.arg(&config.output_path);
-
-    // Pipe setup - redirect stderr to null to prevent buffer fill hang
+    // Pipe setup.
+    // We pipe stderr and drain it in a separate thread to prevent buffer hangs,
+    // while still being able to report real FFmpeg errors.
     cmd.stdin(Stdio::piped())
-       .stdout(Stdio::null())
-       .stderr(Stdio::null());  // FIXED: Redirect stderr to null instead of piped
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
 
     cmd.spawn().map_err(|e| format!("Failed to start FFmpeg: {}", e))
 }
+
 
 /// Run GPU-accelerated export with triple-buffered pipeline
 pub fn run_gpu_export(
@@ -224,96 +439,46 @@ pub fn run_gpu_export(
     });
 }
 
+
 fn run_gpu_export_impl(
     config: AppConfig,
     audio_analysis: AudioAnalysis,
     export_config: GpuExportConfig,
     progress_tx: &MpscSender<GpuExportMessage>,
 ) -> Result<(), String> {
+    use crate::audio::{AdaptiveAudioNormalizer, NormalizedAudio};
+    use crate::config::{BlendMode, ParticleMode, ParticleShape};
+    use crate::particles::ParticleEngine;
+
     let width = export_config.width;
     let height = export_config.height;
-    let fps = export_config.fps;
-    let total_frames = (export_config.duration_secs * fps as f32) as usize;
+    let fps = export_config.fps.max(1);
+    let dt = 1.0 / fps as f32;
 
-    // 1. Initialize Renderer
-    let mut renderer = GpuRenderer::new(width, height, config.particles.count as u32)
+    // Render from the very start of the track
+    let total_output_frames = (export_config.duration_secs * fps as f32).ceil().max(1.0) as usize;
+    let start_frame = (export_config.start_time_secs.max(0.0) * fps as f32).round() as usize;
+    let total_sim_frames = start_frame + total_output_frames;
+
+    // 1) Initialize GPU renderer (rendering only; simulation is done on CPU to match preview 1:1)
+    let renderer = GpuRenderer::new(width, height, config.particles.count as u32)
         .map_err(|e| format!("Failed to init GPU renderer: {}", e))?;
 
-    // 2. Generate Initial Particles - matching preview quality with audio-reactive initialization
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let mut gpu_particles = Vec::with_capacity(config.particles.count);
+    // 2) CPU simulation engines (exactly the same as preview path)
+    let mut particles = ParticleEngine::new(width as f32, height as f32);
     let colors = config.get_color_scheme();
+    particles.update_palette(&colors);
 
-    // Size factor matching preview - shader now handles volumetric rendering correctly
-    // Preview's draw_volumetric_particle uses radius from size*1.5 (outer) to size*0.1 (inner)
-    // Shader quad size is controlled by glow_mult in vertex shader (3.0 + glow_intensity * 1.5)
-    let size_factor = 1.0;  // No additional boost needed - shader handles this
+    let mut audio_state = AudioState::new();
 
-    let cx = width as f32 / 2.0;
-    let cy = height as f32 / 2.0;
+    // Adaptive audio normalization (same logic as preview)
+    let mut audio_normalizer = AdaptiveAudioNormalizer::new(config.particles.adaptive_window_secs, fps);
+    let mut normalized_audio: Option<NormalizedAudio> = None;
 
-    for i in 0..config.particles.count {
-        // Initial position - spawn from center area like preview's spawn_audio_particle
-        let angle = rng.gen_range(0.0..std::f32::consts::TAU);
-        let radius = rng.gen_range(10.0..config.particles.spawn_radius);
-        let pos = [cx + angle.cos() * radius, cy + angle.sin() * radius];
+    // Reusable GPU particle upload buffer to avoid per-frame allocations.
+    let mut gpu_particles: Vec<GpuParticle> = Vec::with_capacity(config.particles.count.max(1024));
 
-        // Small initial velocity, outward from center
-        let speed = 0.1 + rng.gen::<f32>() * 0.2;
-        let vel = [angle.cos() * speed, angle.sin() * speed];
-
-        // Assign random color from scheme
-        let color_idx = rng.gen_range(0..colors.particles.len());
-        let p_color = colors.particles[color_idx];
-        let color_val = [
-            p_color[0] as f32 / 255.0,
-            p_color[1] as f32 / 255.0,
-            p_color[2] as f32 / 255.0,
-            1.0,
-        ];
-
-        // Calculate particle size with variation, matching preview exactly
-        let base_size = config.particles.min_size + rng.gen::<f32>() * (config.particles.max_size - config.particles.min_size);
-        let size_var = 1.0 + (rng.gen::<f32>() - 0.5) * config.particles.size_variation;
-        let final_size = base_size * size_var * size_factor;
-
-        // CRITICAL: Match preview's particle lifecycle
-        // Preview uses life: 2-5 seconds, audio_alpha: 0.1 (starts low, ramps up)
-        // Stagger initial life so particles don't all die at once
-        let initial_life = if config.particles.audio_reactive_spawn {
-            // For audio-reactive mode: short life like preview, staggered
-            0.5 + rng.gen::<f32>() * 2.0 + (i as f32 / config.particles.count as f32) * 2.0
-        } else {
-            // For non-reactive mode: longer life
-            2.0 + rng.gen::<f32>() * 3.0
-        };
-
-        // Start with HIGHER alpha for better initial visibility
-        // Preview's particles ramp up quickly, so we start with moderate alpha
-        let initial_alpha = if config.particles.audio_reactive_spawn {
-            0.5 // Higher initial alpha for better visibility
-        } else {
-            1.0 // Non-reactive mode: fully visible
-        };
-
-        gpu_particles.push(GpuParticle {
-            position: pos,
-            velocity: vel,
-            color: color_val,
-            size: final_size,
-            life: initial_life,
-            max_life: 5.0, // Matches preview's max_life
-            audio_alpha: initial_alpha,
-            audio_size: 1.0,  // Full size from start for better visibility
-            brightness: 1.2,  // Slightly boosted brightness
-            _padding: [0.0; 2],
-        });
-    }
-
-    renderer.upload_particles(&gpu_particles);
-
-    // 3. Start FFmpeg with triple-buffered async pipeline
+    // 3) Start FFmpeg + writer thread (triple-buffered)
     let ffmpeg = start_ffmpeg(&export_config)?;
 
     // Create bounded channel for triple-buffering (3 frames in flight)
@@ -324,6 +489,24 @@ fn run_gpu_export_impl(
     let progress_tx_clone = progress_tx.clone();
     let ffmpeg_handle = thread::spawn(move || -> Result<(), String> {
         let mut ffmpeg = ffmpeg;
+
+        // Drain FFmpeg stderr continuously to avoid pipe buffer deadlocks,
+        // while keeping a tail for better error reports.
+        let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::with_capacity(200)));
+        let stderr_tail_clone = Arc::clone(&stderr_tail);
+
+        let stderr_handle = ffmpeg.stderr.take().map(|stderr| {
+            thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().flatten() {
+                    let mut q = stderr_tail_clone.lock().unwrap();
+                    if q.len() >= 200 {
+                        q.pop_front();
+                    }
+                    q.push_back(line);
+                }
+            })
+        });
 
         let mut last_progress_frame = 0;
         let progress_interval = 15;
@@ -338,10 +521,10 @@ fn run_gpu_export_impl(
                     .map_err(|e| format!("FFmpeg write error: {}", e))?;
 
                 // Send progress updates (from writer thread for accurate encoding progress)
-                if frame.frame_index - last_progress_frame >= progress_interval {
+                if frame.frame_index.saturating_sub(last_progress_frame) >= progress_interval {
                     let _ = progress_tx_clone.send(GpuExportMessage::Progress {
                         current: frame.frame_index,
-                        total: total_frames,
+                        total: total_output_frames,
                         fps: 0.0, // Will be calculated from elapsed time
                     });
                     last_progress_frame = frame.frame_index;
@@ -350,7 +533,6 @@ fn run_gpu_export_impl(
         }
 
         // CRITICAL FIX: Take ownership of stdin and drop it to signal EOF to FFmpeg
-        // Previously used drop(stdin) which dropped a reference - did nothing!
         drop(ffmpeg.stdin.take());
 
         // Wait for FFmpeg to finish with timeout
@@ -361,14 +543,25 @@ fn run_gpu_export_impl(
             match ffmpeg.try_wait() {
                 Ok(Some(status)) => {
                     if !status.success() {
-                        return Err(format!("FFmpeg exited with code: {:?}", status.code()));
+                        if let Some(h) = stderr_handle { let _ = h.join(); }
+                        let tail = {
+                            let q = stderr_tail.lock().unwrap();
+                            q.iter().cloned().collect::<Vec<_>>().join("\n")
+                        };
+                        return Err(format!("FFmpeg exited with code: {:?}\n{}", status.code(), tail));
                     }
+                    if let Some(h) = stderr_handle { let _ = h.join(); }
                     break;
                 }
                 Ok(None) => {
                     if wait_start.elapsed() > timeout {
                         let _ = ffmpeg.kill();
-                        return Err("FFmpeg encoding timeout".to_string());
+                        if let Some(h) = stderr_handle { let _ = h.join(); }
+                        let tail = {
+                            let q = stderr_tail.lock().unwrap();
+                            q.iter().cloned().collect::<Vec<_>>().join("\n")
+                        };
+                        return Err(format!("FFmpeg encoding timeout\n{}", tail));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
@@ -381,164 +574,198 @@ fn run_gpu_export_impl(
         Ok(())
     });
 
-    // 4. Audio State
-    let mut audio_state = AudioState::new();
-
-    // 5. Render Loop (async - doesn't wait for FFmpeg writes)
-    let dt = 1.0 / fps as f32;
-    let mut time = 0.0;
+    // 4) Render loop
     let start_time = std::time::Instant::now();
+    // Precompute background (sRGB->linear) each frame (depends on alpha-export mode)
+    let srgb_to_linear = |srgb: u8| -> f32 {
+        let c = srgb as f32 / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
 
-    for frame_idx in 0..total_frames {
-        // Audio Update
-        let audio_frame_idx = (frame_idx as f32 * audio_analysis.fps as f32 / fps as f32) as usize;
+    for sim_frame_idx in 0..total_sim_frames {
+        // ============================================================
+        // AUDIO UPDATE (frame-accurate)
+        // ============================================================
+        let audio_frame_idx = (sim_frame_idx as f32 * audio_analysis.fps as f32 / fps as f32) as usize;
         if audio_frame_idx < audio_analysis.total_frames {
             let frame = audio_analysis.get_frame(audio_frame_idx);
             audio_state.update_from_frame(&frame, config.audio.smoothing);
         }
+        audio_state.update_smoothing(dt, config.audio.smoothing, config.audio.beat_attack, config.audio.beat_decay);
 
-        // Apply adaptive audio normalization if enabled (matching preview behavior)
-        let (normalized_amplitude, normalized_bass, normalized_mid, normalized_high) =
-            if config.particles.adaptive_audio_enabled {
-                // Simple adaptive normalization: boost quiet sections, compress loud sections
-                // This matches the preview's NormalizedAudio behavior
-                let base_amp = audio_state.amplitude;
-                let adaptive = config.particles.adaptive_strength;
-
-                // Apply frequency-weighted sensitivity (matching preview)
-                let bass = (audio_state.bass * config.particles.bass_sensitivity).min(1.5);
-                let mid = (audio_state.mid * config.particles.mid_sensitivity).min(1.5);
-                let high = (audio_state.high * config.particles.high_sensitivity).min(1.5);
-
-                // Compute weighted intensity
-                let intensity = (bass * 0.4 + mid * 0.35 + high * 0.25).clamp(0.0, 1.5);
-
-                // Blend between raw and normalized based on adaptive_strength
-                let final_amp = base_amp * (1.0 - adaptive * 0.5) + intensity * adaptive * 0.5;
-
-                (final_amp.clamp(0.0, 1.5), bass, mid, high)
-            } else {
-                (audio_state.amplitude, audio_state.bass, audio_state.mid, audio_state.high)
-            };
-
-        // Sim Params - use actual config values for proper physics matching preview
-        let sim_params = SimParams {
-            delta_time: dt,
-            time,
-            width: width as f32,
-            height: height as f32,
-            audio_amplitude: normalized_amplitude,
-            audio_bass: normalized_bass,
-            audio_mid: normalized_mid,
-            audio_high: normalized_high,
-            audio_beat: audio_state.beat,
-            beat_burst_strength: config.particles.beat_burst_strength,
-            damping: config.particles.damping,
-            speed: config.particles.speed,
-            num_particles: config.particles.count as u32,
-            has_audio: 1,
-            // Audio-reactive parameters matching preview
-            fade_attack_speed: config.particles.fade_attack_speed,
-            fade_release_speed: config.particles.fade_release_speed,
-            audio_spawn_threshold: config.particles.audio_spawn_threshold,
-            audio_reactive_spawn: if config.particles.audio_reactive_spawn { 1 } else { 0 },
-            spawn_radius: config.particles.spawn_radius,
-            gravity: config.particles.gravity,
-            _padding: [0.0; 2],
+        // Adaptive normalization (same as preview)
+        let normalized_ref: Option<&NormalizedAudio> = if config.particles.adaptive_audio_enabled {
+            let norm = audio_normalizer.normalize(
+                audio_state.smooth_bass,
+                audio_state.smooth_mid,
+                audio_state.smooth_high,
+                config.particles.bass_sensitivity,
+                config.particles.mid_sensitivity,
+                config.particles.high_sensitivity,
+                config.particles.adaptive_strength,
+            );
+            normalized_audio = Some(norm);
+            normalized_audio.as_ref()
+        } else {
+            None
         };
 
-        // Render Params - BOOSTED for better visibility to match preview quality
+        // ============================================================
+        // PARTICLE SIM (CPU) - matches preview logic exactly
+        // ============================================================
+        let death_spiral_ref = if config.particles.mode == ParticleMode::DeathSpiral {
+            Some(&config.death_spiral)
+        } else {
+            None
+        };
+
+        particles.update(
+            &config.particles,
+            &config.connections,
+            death_spiral_ref,
+            &audio_state,
+            dt,
+            normalized_ref,
+        );
+        particles.update_trails(&config.trails, dt);
+
+        // Optional pre-roll: simulate up to start_time without rendering/encoding.
+        if sim_frame_idx < start_frame {
+            continue;
+        }
+        let out_frame_idx = sim_frame_idx - start_frame;
+
+        // Upload particles to GPU (rendering only)
+        gpu_particles.clear();
+        gpu_particles.extend(particles.get_particles().iter().map(crate::gpu_render::cpu_particle_to_gpu));
+        renderer.upload_particles(&gpu_particles);
+        let num_particles = gpu_particles.len() as u32;
+
+        // ============================================================
+        // RENDER PARAMS (background + shape + bloom/exposure)
+        // ============================================================
+        let colors = config.get_color_scheme();
+
+        let (bg_r, bg_g, bg_b, bg_a) = if export_config.format.supports_alpha() {
+            (0.0, 0.0, 0.0, 0.0)
+        } else {
+            (
+                srgb_to_linear(colors.background[0]),
+                srgb_to_linear(colors.background[1]),
+                srgb_to_linear(colors.background[2]),
+                1.0,
+            )
+        };
+
+        let shape_id = match config.particles.shape {
+            ParticleShape::Circle => 0.0,
+            ParticleShape::Diamond => 1.0,
+            ParticleShape::Star => 2.0,
+            ParticleShape::Ring => 3.0,
+            ParticleShape::Triangle => 4.0,
+            ParticleShape::Spark => 5.0,
+            ParticleShape::Glow => 6.0,
+            ParticleShape::Point => 7.0,
+        };
+
+        // Match preview global size pulse used in ParticleEngine::draw().
+        // In preview: size *= (1.0 + eff_amp * 0.2)
+        let eff_amp: f32 = if config.particles.adaptive_audio_enabled {
+            normalized_ref.map(|n| n.intensity).unwrap_or(audio_state.amplitude)
+        } else {
+            audio_state.amplitude
+        }
+        .clamp(0.0, 1.0);
+
         let render_params = RenderParams {
             width: width as f32,
             height: height as f32,
-            glow_intensity: config.particles.glow_intensity.max(0.5), // Minimum glow for visibility
-            exposure: 1.2,  // Boosted exposure for brighter output
-            bloom_strength: config.visual.bloom_intensity.max(0.3) * 1.5, // Enhanced bloom
-            shape_id: match config.particles.shape {
-                crate::config::ParticleShape::Circle => 0.0,
-                crate::config::ParticleShape::Diamond => 1.0,
-                crate::config::ParticleShape::Star => 2.0,
-                _ => 0.0,
-            },
-            _padding: [0.0; 2],
-        };
-
-        // GPU Execution
-        renderer.upload_spectrum(&audio_state.spectrum);
-        renderer.simulate_particles(&sim_params);
-
-        // Get background color - convert sRGB to linear for correct rendering
-        // The output texture (Rgba8UnormSrgb) will convert linear back to sRGB
-        let colors = config.get_color_scheme();
-        let srgb_to_linear = |srgb: u8| -> f32 {
-            let s = srgb as f32 / 255.0;
-            if s <= 0.04045 {
-                s / 12.92
+            glow_intensity: config.particles.glow_intensity,
+            exposure: config.visual.exposure,
+            // IMPORTANT: preview-style glow is mostly handled in the particle shader.
+            // Bloom is optional; keep it subtle to avoid "blocky" halos.
+            bloom_strength: if config.visual.bloom_enabled {
+                config.visual.bloom_intensity
             } else {
-                ((s + 0.055) / 1.055).powf(2.4)
-            }
+                0.0
+            },
+            shape_id,
+            bg_r,
+            bg_g,
+            bg_b,
+            bg_a,
+            _padding: [
+                eff_amp,
+                if config.particles.volumetric_rendering {
+                    config.particles.volumetric_steps as f32
+                } else {
+                    0.0
+                },
+            ],
         };
-        let bg = [
-            srgb_to_linear(colors.background[0]),
-            srgb_to_linear(colors.background[1]),
-            srgb_to_linear(colors.background[2]),
-            1.0
-        ];
 
-        renderer.render_particles(config.particles.count as u32, &render_params, bg);
+        // ============================================================
+        // GPU RENDER
+        // ============================================================
+        let additive_blend = matches!(config.particles.blend_mode, BlendMode::Add);
+        renderer.render_particles(
+            num_particles,
+            &render_params,
+            [0.0, 0.0, 0.0, 0.0],
+            additive_blend,
+        );
 
-        // Render and upload overlay
+        // Overlay (spectrum/waveform meters etc) in CPU - shared by preview/export
         let overlay_pixels = render_overlay_cpu(width, height, &audio_state, &config);
         renderer.upload_overlay(&overlay_pixels);
 
-        // Run bloom pass for glow effect (must be done before tonemap)
-        renderer.run_bloom();
-
+        // Optional bloom
+        if render_params.bloom_strength > 0.001 {
+            renderer.run_bloom();
+        }
         renderer.tonemap(&render_params);
 
-        // Readback frame from GPU
+        // Readback
         let pixels = renderer.read_frame();
 
-        // Send to FFmpeg writer thread (non-blocking with triple-buffer)
-        // This allows GPU to continue rendering while FFmpeg writes
-        if frame_tx.send(FrameData { frame_index: frame_idx, pixels }).is_err() {
+        if frame_tx.send(FrameData { frame_index: out_frame_idx, pixels }).is_err() {
             return Err("FFmpeg writer thread closed unexpectedly".to_string());
         }
 
-        time += dt;
-
-        // Update progress with render FPS (separate from encoding progress)
-        if frame_idx % 30 == 0 {
+        // Progress every ~0.5 sec
+        if out_frame_idx % (fps as usize / 2).max(1) == 0 {
             let elapsed = start_time.elapsed().as_secs_f32();
-            let render_fps = frame_idx as f32 / elapsed.max(0.001);
+            let render_fps = (out_frame_idx + 1) as f32 / elapsed.max(0.001);
             let _ = progress_tx.send(GpuExportMessage::Progress {
-                current: frame_idx,
-                total: total_frames,
+                current: out_frame_idx,
+                total: total_output_frames,
                 fps: render_fps,
             });
         }
     }
 
-    // Close frame channel to signal completion
     drop(frame_tx);
 
-    // Wait for FFmpeg writer thread to finish
-    let ffmpeg_result = ffmpeg_handle.join()
+    let ffmpeg_result = ffmpeg_handle
+        .join()
         .map_err(|_| "FFmpeg writer thread panicked".to_string())?;
-
-    // Check for FFmpeg errors
     ffmpeg_result?;
 
-    // Send 100% progress after successful completion
+    // Final progress + completion
     let _ = progress_tx.send(GpuExportMessage::Progress {
-        current: total_frames,
-        total: total_frames,
+        current: total_output_frames,
+        total: total_output_frames,
         fps: 0.0,
     });
 
     let _ = progress_tx.send(GpuExportMessage::Completed { path: output_path });
     Ok(())
 }
+
 
 /// Check if GPU export is available
 pub fn is_gpu_export_available() -> bool {
@@ -737,7 +964,7 @@ fn draw_circle_outline(
 }
 
 /// Software renderer for visual overlays (Waveform/Spectrum)
-fn render_overlay_cpu(width: u32, height: u32, audio: &AudioState, config: &AppConfig) -> Vec<u8> {
+pub(crate) fn render_overlay_cpu(width: u32, height: u32, audio: &AudioState, config: &AppConfig) -> Vec<u8> {
     let mut image = ImageBuffer::from_pixel(width, height, Rgba([0u8, 0, 0, 0]));
     let colors = config.get_color_scheme();
 

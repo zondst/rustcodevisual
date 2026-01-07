@@ -49,16 +49,30 @@ pub struct SimParams {
     pub _padding: [f32; 2],
 }
 
-/// Render parameters for the particle rendering pass
+/// Render parameters for the particle rendering + tonemap passes
+///
+/// Note: this struct is shared between the particle render pass and the tonemap pass.
+/// Keep it tightly packed and WGSL-compatible (all scalars) to avoid alignment surprises.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct RenderParams {
     pub width: f32,
     pub height: f32,
+    /// Particle glow / soft edge strength
     pub glow_intensity: f32,
+    /// Exposure applied to *particles* (not background/overlay)
     pub exposure: f32,
+    /// Bloom strength applied to *particles*
     pub bloom_strength: f32,
+    /// Selected particle shape id
     pub shape_id: f32,
+    /// Background color in **linear** space (RGB) and alpha.
+    ///
+    /// For alpha-capable exports you typically want bg_a = 0 and bg_rgb = 0.
+    pub bg_r: f32,
+    pub bg_g: f32,
+    pub bg_b: f32,
+    pub bg_a: f32,
     pub _padding: [f32; 2],
 }
 
@@ -70,15 +84,20 @@ pub struct GpuRenderer {
     // Render targets
     render_texture: wgpu::Texture,
     render_view: wgpu::TextureView,
+    // We keep the backing textures around to own the GPU resources.
+    // Only the views are used in pipelines, so Rust would otherwise warn these are "never read".
+    #[allow(dead_code)]
     hdr_texture: wgpu::Texture,
     hdr_view: wgpu::TextureView,
 
     // MSAA textures for anti-aliased particle rendering
+    #[allow(dead_code)]
     msaa_texture: wgpu::Texture,
     msaa_view: wgpu::TextureView,
     sample_count: u32,
 
     // Bloom textures (mip chain)
+    #[allow(dead_code)]
     bloom_textures: Vec<wgpu::Texture>,
     bloom_views: Vec<wgpu::TextureView>,
 
@@ -90,22 +109,26 @@ pub struct GpuRenderer {
     staging_buffer: wgpu::Buffer,
     bytes_per_row: u32,
 
-    // Compute pipeline for particle simulation
+    // Compute pipeline for particle simulation (optional / future use)
+    #[allow(dead_code)]
     compute_pipeline: wgpu::ComputePipeline,
+    #[allow(dead_code)]
     compute_bind_group_layout: wgpu::BindGroupLayout,
 
     // Particle buffers (double-buffered)
     particle_buffers: [wgpu::Buffer; 2],
     current_buffer: usize,
 
-    // Spectrum buffer for audio data
+    // Spectrum buffer for audio data (optional)
+    #[allow(dead_code)]
     spectrum_buffer: wgpu::Buffer,
 
-    // Simulation params uniform
+    // Simulation params uniform (optional)
+    #[allow(dead_code)]
     sim_params_buffer: wgpu::Buffer,
-
-    // Render pipeline for particles
-    render_pipeline: wgpu::RenderPipeline,
+    // Render pipelines for particles (normal over / additive)
+    render_pipeline_alpha: wgpu::RenderPipeline,
+    render_pipeline_additive: wgpu::RenderPipeline,
     render_bind_group_layout: wgpu::BindGroupLayout,
     render_params_buffer: wgpu::Buffer,
 
@@ -124,6 +147,7 @@ pub struct GpuRenderer {
     // Dimensions
     width: u32,
     height: u32,
+    #[allow(dead_code)]
     max_particles: u32,
 }
 
@@ -443,8 +467,13 @@ impl GpuRenderer {
             push_constant_ranges: &[],
         });
 
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Particle Render Pipeline"),
+        
+
+        // Two particle pipelines:
+        // - Alpha (premultiplied "over") for normal blending
+        // - Additive (RGB add) for glow-heavy looks
+        let render_pipeline_alpha = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Particle Render Pipeline (Alpha)"),
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &render_shader,
@@ -456,7 +485,7 @@ impl GpuRenderer {
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba16Float,
-                    // Use premultiplied alpha blending to match preview quality
+                    // Premultiplied alpha OVER: out = src + dst*(1-src.a)
                     blend: Some(wgpu::BlendState {
                         color: wgpu::BlendComponent {
                             src_factor: wgpu::BlendFactor::One,
@@ -477,7 +506,6 @@ impl GpuRenderer {
                 ..Default::default()
             },
             depth_stencil: None,
-            // MSAA multisample state - must match the MSAA texture sample count
             multisample: wgpu::MultisampleState {
                 count: sample_count,
                 mask: !0,
@@ -486,7 +514,50 @@ impl GpuRenderer {
             multiview: None,
         });
 
-        // Create bloom downsample pipeline
+        let render_pipeline_additive = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Particle Render Pipeline (Additive)"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &render_shader,
+                entry_point: "vs_main",
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &render_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    // Additive RGB (glow): out.rgb = src.rgb + dst.rgb
+                    // Keep alpha as OVER so we still have meaningful coverage for alpha exports.
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+        });
+
+// Create bloom downsample pipeline
         let bloom_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Bloom Shader"),
             source: wgpu::ShaderSource::Wgsl(BLOOM_SHADER.into()),
@@ -656,7 +727,8 @@ impl GpuRenderer {
             current_buffer: 0,
             spectrum_buffer,
             sim_params_buffer,
-            render_pipeline,
+            render_pipeline_alpha,
+            render_pipeline_additive,
             render_bind_group_layout,
             render_params_buffer,
             bloom_downsample_pipeline,
@@ -678,6 +750,7 @@ impl GpuRenderer {
     }
 
     /// Upload spectrum data
+    #[allow(dead_code)]
     pub fn upload_spectrum(&self, spectrum: &[f32]) {
         let mut padded = [0.0f32; 64];
         let len = spectrum.len().min(64);
@@ -709,6 +782,7 @@ impl GpuRenderer {
     }
 
     /// Run particle simulation compute shader
+    #[allow(dead_code)]
     pub fn simulate_particles(&mut self, params: &SimParams) {
         // Upload params
         self.queue.write_buffer(&self.sim_params_buffer, 0, bytemuck::bytes_of(params));
@@ -761,7 +835,13 @@ impl GpuRenderer {
     }
 
     /// Render particles to HDR texture with MSAA anti-aliasing
-    pub fn render_particles(&self, num_particles: u32, params: &RenderParams, bg_color: [f32; 4]) {
+    pub fn render_particles(
+        &self,
+        num_particles: u32,
+        params: &RenderParams,
+        clear_color: [f32; 4],
+        additive_blend: bool,
+    ) {
         self.queue.write_buffer(&self.render_params_buffer, 0, bytemuck::bytes_of(params));
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -800,10 +880,10 @@ impl GpuRenderer {
                     resolve_target,  // MSAA resolve to HDR texture
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: bg_color[0] as f64,
-                            g: bg_color[1] as f64,
-                            b: bg_color[2] as f64,
-                            a: bg_color[3] as f64,
+                            r: clear_color[0] as f64,
+                            g: clear_color[1] as f64,
+                            b: clear_color[2] as f64,
+                            a: clear_color[3] as f64,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -813,7 +893,12 @@ impl GpuRenderer {
                 occlusion_query_set: None,
             });
 
-            render_pass.set_pipeline(&self.render_pipeline);
+            let pipeline = if additive_blend {
+                &self.render_pipeline_additive
+            } else {
+                &self.render_pipeline_alpha
+            };
+            render_pass.set_pipeline(pipeline);
             render_pass.set_bind_group(0, &bind_group, &[]);
             // 6 vertices per particle (2 triangles for quad)
             render_pass.draw(0..6, 0..num_particles);
@@ -982,7 +1067,7 @@ impl GpuRenderer {
                     view: &self.render_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1057,6 +1142,7 @@ impl GpuRenderer {
     }
 
     /// Get dimensions
+    #[allow(dead_code)]
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
     }
@@ -1259,8 +1345,12 @@ struct RenderParams {
     exposure: f32,
     bloom_strength: f32,
     shape_id: f32,
-    _pad2: f32,
-    _pad3: f32,
+    bg_r: f32,
+    bg_g: f32,
+    bg_b: f32,
+    bg_a: f32,
+    _pad0: f32,
+    _pad1: f32,
 }
 
 struct VertexOutput {
@@ -1316,8 +1406,14 @@ fn vs_main(
     // Scale by particle size with glow extension - BOOSTED to match preview volumetric rendering
     // Preview's draw_volumetric_particle draws multiple layers from size*0.1 to size*1.5
     // We need larger quads to accommodate the full glow effect plus extra for smooth edges
-    let glow_mult = 5.0 + params.glow_intensity * 2.5;
-    let size = p.size * p.audio_size * glow_mult;
+    // Quad covers the full glow radius.
+    // In the preview glow_radius = base_radius * (1.0 + glow_intensity * 2.0).
+    // We match that here so dist≈1.0 corresponds to the glow radius.
+    let glow_mult = 1.0 + params.glow_intensity * 2.0;
+    // Match preview: p.size already includes audio_size & beat pulse.
+    // Preview draw() applies a subtle global pulse: size *= (1.0 + eff_amp * 0.2)
+    let size_pulse = 1.0 + params._pad0 * 0.2;
+    let size = p.size * glow_mult * size_pulse;
 
     // Convert to clip space
     let world_pos = p.position + quad_pos * size;
@@ -1329,13 +1425,11 @@ fn vs_main(
     // Compute alpha from life and audio - SIGNIFICANTLY boosted for better visibility
     // Preview's particles are much more visible, so we need higher alpha
     let life_alpha = clamp(p.life / p.max_life, 0.0, 1.0);
-    let alpha = clamp(life_alpha * p.audio_alpha * p.brightness * 2.0, 0.0, 1.0);
+    let alpha = clamp(life_alpha * p.audio_alpha * p.brightness, 0.0, 1.0);
 
-    // Use colors directly with brightness boost - matches preview rendering
-    let boosted_color = p.color.rgb * 1.3;  // Boost color brightness
-    output.color = vec4<f32>(boosted_color, alpha);
+    output.color = vec4<f32>(p.color.rgb, alpha);
     output.uv = quad_uv;
-    output.glow = params.glow_intensity * 1.5;  // Boost glow intensity
+    output.glow = params.glow_intensity;
 
     return output;
 }
@@ -1371,61 +1465,70 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         dist = length(uv - center) * 2.0;
     }
 
-    // =========================================================
-    // ENHANCED volumetric rendering to match preview quality
-    // Preview draws multiple concentric circles with varying alpha
-    // We simulate this with a smooth gradient that's brighter and more visible
-    // =========================================================
+    
+// =========================================================
+// Volumetric particle shading (preview-matching)
+//
+// IMPORTANT: Do NOT clamp dist to 1.0.
+// dist is normalized such that:
+//   dist ~= 0 at center
+//   dist ~= 1 at the outer glow radius (set in VS via glow_mult)
+// Allowing dist>1 fades corners and prevents square artifacts in export.
+// =========================================================
 
-    // t represents position in the gradient (0 = center, 1 = outer edge)
-    let t = clamp(dist, 0.0, 1.0);
+let dist2 = dist * dist;
 
-    // STRONGER Gaussian falloff for more visible core
-    // Using exp(-2.0 * t * t) instead of -3.0 for wider bright area
-    let gaussian = exp(-2.0 * t * t);
+// Use params._pad1 to carry volumetric settings:
+//   <0.5  => volumetric_rendering OFF  (simple, crisp particle)
+//   >=0.5 => volumetric_rendering ON   (gaussian layers), value ~ steps count
+let steps = params._pad1;
 
-    // STRONGER center brightness boost
-    // Creates a bright hot core that matches preview's layered rendering
-    let inner_t = 1.0 - t;  // 1 at center, 0 at edge
-    let center_boost = 1.0 + inner_t * inner_t * 2.0;  // Quadratic boost towards center
+var intensity: f32 = 0.0;
+var core: f32 = 0.0;
 
-    // Base intensity - increased from 0.7 to 1.0 for brighter particles
-    let base_intensity = gaussian * center_boost * 1.0;
+if (steps < 0.5) {
+    // Simple disc with a soft AA edge.
+    let edge = 1.0 - smoothstep(0.92, 1.0, dist);
+    intensity = edge;
 
-    // Glow extension - wider and stronger glow halo
-    let glow_fade = exp(-1.0 * t * t) * input.glow * 0.8;
+    // Optional tiny glow to avoid harsh aliasing on very small particles.
+    intensity = intensity + (1.0 - smoothstep(1.0, 1.25, dist)) * input.glow * 0.08;
+    core = exp(-35.0 * dist2);
+} else {
+    // Volumetric: adjust falloff with "steps" (more steps => wider, smoother glow).
+    let falloff = clamp(8.0 / steps, 0.5, 2.0);
 
-    // Combine for total intensity with minimum brightness
-    let intensity = base_intensity + glow_fade;
+    // Preview uses gaussian exp(-2.5 * t^2)
+    let base = exp(-2.5 * dist2 * falloff);
 
-    // Convert input color to linear space for correct blending
+    // Wider halo component (glow)
+    let halo = exp(-0.9 * dist2 * falloff) * input.glow * 0.6;
+
+    // Tight hot core (roughly size*0.2)
+    core = exp(-40.0 * dist2 * falloff);
+
+    intensity = base + halo;
+}
+
+let final_alpha = clamp(input.color.a * intensity, 0.0, 1.0);
+
+// Convert input color to linear space for correct blending
     // (input colors are in sRGB, GPU does linear blending)
-    let linear_color = srgb_to_linear(input.color.rgb);
+let linear_color = srgb_to_linear(input.color.rgb);
 
-    // Brightness towards center matching preview: (1.0 + (1.0 - t) * 0.3)
-    let brightness_mult = 1.0 + inner_t * 0.3;
-    let brightened_color = linear_color * brightness_mult;
+// Slight core boost + subtle white hot center (preview-style)
+let core_boost = 1.0 + core * 0.35;
+let hot_core = vec3<f32>(1.0) * core * 0.7;
 
-    // Hot white center exactly as preview: +50/255 RGB when alpha > 0.04 (10/255)
-    let hot_center_strength = smoothstep(0.15, 0.0, dist);
-    let hot_center = select(
-        vec3<f32>(0.0),
-        vec3<f32>(50.0 / 255.0) * hot_center_strength,
-        input.color.a > 0.04
-    );
+let rgb_unpremult = linear_color * core_boost + hot_core;
 
-    // Glow intensity boost matching preview
-    let glow_boost = 1.0 + input.glow * 0.8;
-    let final_color = (brightened_color + hot_center) * intensity * glow_boost;
-    let final_alpha = input.color.a * intensity;
+// Skip nearly invisible fragments
+if (final_alpha < 0.001) {
+    discard;
+}
 
-    // Skip nearly invisible fragments
-    if (final_alpha < 0.001) {
-        discard;
-    }
-
-    // Output premultiplied alpha for correct blending
-    return vec4<f32>(final_color * final_alpha, final_alpha);
+// Output premultiplied alpha for correct blending
+return vec4<f32>(rgb_unpremult * final_alpha, final_alpha);
 }
 "#;
 
@@ -1505,8 +1608,12 @@ struct RenderParams {
     exposure: f32,
     bloom_strength: f32,
     shape_id: f32,
-    _pad2: f32,
-    _pad3: f32,
+    bg_r: f32,
+    bg_g: f32,
+    bg_b: f32,
+    bg_a: f32,
+    _pad0: f32,
+    _pad1: f32,
 }
 
 struct VertexOutput {
@@ -1535,14 +1642,6 @@ fn vs_main(@builtin(vertex_index) vertex_idx: u32) -> VertexOutput {
     return output;
 }
 
-// Convert linear to sRGB for accurate color output
-fn linear_to_srgb(color: vec3<f32>) -> vec3<f32> {
-    let cutoff = color < vec3<f32>(0.0031308);
-    let lower = color * 12.92;
-    let higher = pow(color, vec3<f32>(1.0 / 2.4)) * 1.055 - 0.055;
-    return select(higher, lower, cutoff);
-}
-
 // Soft tone mapping - preserves colors for particle rendering
 fn soft_tonemap(color: vec3<f32>) -> vec3<f32> {
     // Very gentle compression only for values above 1.0
@@ -1558,37 +1657,72 @@ fn soft_tonemap(color: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    var hdr_color = textureSample(hdr_texture, tex_sampler, input.uv).rgb;
+    // HDR buffer stores premultiplied RGB + alpha from the particle pass.
+    let hdr = textureSample(hdr_texture, tex_sampler, input.uv);
+    let base_alpha = clamp(hdr.a, 0.0, 1.0);
 
-    // Sample bloom and add it to HDR color
-    let bloom_color = textureSample(bloom_texture, tex_sampler, input.uv).rgb;
-    hdr_color = hdr_color + bloom_color * params.bloom_strength * 1.5;
+    // Bloom is computed in HDR space (linear). It may extend beyond the particle alpha.
+    let bloom = textureSample(bloom_texture, tex_sampler, input.uv).rgb;
+    let bloom_premult = bloom * params.bloom_strength * 1.5;
 
-    // Apply exposure - BOOSTED for brighter output
+    // Combine in premultiplied HDR space
+    var premult = hdr.rgb + bloom_premult;
+
+    // Exposure in linear light
     let exposure_mult = pow(2.0, params.exposure);
-    hdr_color = hdr_color * exposure_mult;
+    premult = premult * exposure_mult;
 
-    // Very gentle tone mapping that preserves colors
-    var color = soft_tonemap(hdr_color);
+    // Derive an alpha contribution from bloom so glow survives on transparent backgrounds.
+    // For glowy visuals this works much better than keeping alpha = particle coverage only.
+    let bloom_alpha = clamp(
+        max(max(bloom_premult.r, bloom_premult.g), bloom_premult.b) * exposure_mult * 1.2,
+        0.0,
+        1.0
+    );
 
-    // Clamp to valid range
+    // Effective base alpha (particles + bloom)
+    let alpha_base = max(base_alpha, bloom_alpha);
+
+    // Un-premultiply for tone mapping in linear space
+    let safe_a = max(alpha_base, 1e-4);
+    var color = premult / safe_a;
+
+    // Tone mapping + clamp
+    color = soft_tonemap(color);
     color = clamp(color, vec3<f32>(0.0), vec3<f32>(1.0));
 
-    // NOTE: Output format is Rgba8UnormSrgb which automatically applies
-    // sRGB gamma encoding, so we do NOT apply manual gamma correction here.
+    // Convert base back to premultiplied for compositing
+    let base_premult_out = color * alpha_base;
 
-    // Composite overlay on top (waveform, spectrum, etc.)
+    // Overlay (waveform/spectrum) is generated on CPU as *straight* alpha.
+    // Convert to premultiplied for correct compositing.
     let overlay = textureSample(overlay_texture, tex_sampler, input.uv);
+    let overlay_a = clamp(overlay.a, 0.0, 1.0);
+    let overlay_premult = overlay.rgb * overlay_a;
+    // Background (linear) from params. For alpha exports bg_a should be 0.
+    let bg_a = clamp(params.bg_a, 0.0, 1.0);
+    let bg_rgb = clamp(vec3<f32>(params.bg_r, params.bg_g, params.bg_b), vec3<f32>(0.0), vec3<f32>(1.0));
+    let bg_premult = bg_rgb * bg_a;
 
-    // Proper alpha blending for overlay (premultiplied alpha)
-    let overlay_alpha = overlay.a;
-    color = color * (1.0 - overlay_alpha) + overlay.rgb;
+    // Compose overlay OVER background (overlay is straight alpha -> premult already)
+    let mid_a = overlay_a + bg_a * (1.0 - overlay_a);
+    let mid_premult = overlay_premult + bg_premult * (1.0 - overlay_a);
 
-    return vec4<f32>(color, 1.0);
+    // Compose particles OVER (background + overlay) to match preview layering.
+    let out_a = alpha_base + mid_a * (1.0 - alpha_base);
+    let out_premult = base_premult_out + mid_premult * (1.0 - alpha_base);
+    // Output STRAIGHT (unmatted) alpha for easy import into NLEs.
+    let safe_out_a = max(out_a, 1e-4);
+    let out_rgb = clamp(out_premult / safe_out_a, vec3<f32>(0.0), vec3<f32>(1.0));
+
+    // NOTE: Output target is Rgba8UnormSrgb, so the GPU automatically applies
+    // sRGB encoding to RGB channels. Alpha stays linear.
+    return vec4<f32>(out_rgb, out_a);
 }
 "#;
 
 /// Convert CPU particle to GPU format
+#[allow(dead_code)]
 pub fn cpu_particle_to_gpu(p: &crate::particles::Particle) -> GpuParticle {
     GpuParticle {
         position: [p.pos.x, p.pos.y],

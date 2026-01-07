@@ -58,6 +58,8 @@ impl Default for AudioFrame {
 #[derive(Clone)]
 pub struct AudioAnalysis {
     pub frames: Vec<AudioFrame>,
+    // Kept for future UI/diagnostics (e.g. showing track info). Not all code paths use it yet.
+    #[allow(dead_code)]
     pub sample_rate: u32,
     pub duration: f32,
     pub total_frames: usize,
@@ -97,12 +99,14 @@ impl BeatDetector {
         }
     }
 
+    #[allow(dead_code)]
     pub fn default_audio() -> Self {
         Self::new(2000.0, 0.4) // Default: 2000 decay, 40% trigger
     }
 
     /// Detect if current volume represents a beat
     /// Returns (is_beat, beat_strength)
+    #[allow(dead_code)]
     pub fn detect(&mut self, volume: f32) -> (bool, f32) {
         // Decay beat_delta to allow quieter beats to be detected
         self.last_beat_delta *= self.decay;
@@ -139,6 +143,7 @@ impl BeatDetector {
     }
 
     /// Get the last measured volume
+    #[allow(dead_code)]
     pub fn last_volume(&self) -> f32 {
         self.last_volume
     }
@@ -154,10 +159,12 @@ fn interpolate_smooth(current: &mut f32, target: f32, rate: f32, dt: f32) {
 pub struct NormalizedAudio {
     pub bass: f32,                   // 0.0-1.0 normalized bass
     pub mid: f32,                    // 0.0-1.0 normalized mid
+    #[allow(dead_code)]
     pub high: f32,                   // 0.0-1.0 normalized high
     pub intensity: f32,              // Combined weighted intensity
     pub has_significant_audio: bool, // Above local average
     pub has_bass_hit: bool,          // Significant bass spike
+    #[allow(dead_code)]
     pub has_vocal: bool,             // Mid-range spike (vocals)
 }
 

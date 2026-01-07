@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Post-Processing Effects for Particle Studio RS
 //! CPU-based image effects: bloom, blur, vignette, chromatic aberration, etc.
 

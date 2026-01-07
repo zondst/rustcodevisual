@@ -30,7 +30,9 @@ pub struct Particle {
     pub audio_alpha: f32, // Opacity driven by audio (0.0-1.0)
     pub audio_size: f32,  // Size multiplier from audio
     // Death Spiral state
+    #[allow(dead_code)]
     pub ring_index: usize,     // Which ring this particle belongs to
+    #[allow(dead_code)]
     pub position_in_ring: f32, // Position within the ring (0.0-1.0)
 }
 
@@ -160,6 +162,7 @@ impl TrailSystem {
         }
     }
 
+    #[allow(dead_code)]
     pub fn resize(&mut self, particle_count: usize) {
         self.trails
             .resize(particle_count, Vec::with_capacity(self.max_trail_length));
@@ -324,6 +327,7 @@ impl ParticleEngine {
     }
 
     /// Get read-only access to particles for rendering
+    #[allow(dead_code)]
     pub fn get_particles(&self) -> &Vec<Particle> {
         &self.particles
     }
@@ -1650,5 +1654,6 @@ impl ParticleEngine {
     }
 
     /// Placeholder for compatibility
+    #[allow(dead_code)]
     pub fn clone_render_data(&self) {}
 }

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Fractal Renderer for Particle Studio RS
 //! CPU-based raymarching implementation inspired by fractal_sugar
 //! Supports 7 fractal types with audio-reactive coloring

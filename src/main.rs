@@ -18,9 +18,8 @@ mod waveform;
 use audio::{AdaptiveAudioNormalizer, AudioState, AudioSystem, NormalizedAudio};
 use config::{AppConfig, ColorScheme, ParticleMode, ParticleShape, SpectrumStyle, WaveformStyle};
 use eframe::egui;
-use export::VideoExporter;
+use export::{ExportFormat, VideoExporter};
 use offscreen_render::ExportMessage;
-use offscreen_render::FrameRenderer;
 use particles::ParticleEngine;
 use spectrum::SpectrumVisualizer;
 use std::sync::mpsc::{self, Receiver};
@@ -57,6 +56,7 @@ struct ParticleStudioApp {
     // Export state
     export_output_path: Option<std::path::PathBuf>,
     export_duration_secs: f32,
+    export_start_time_secs: f32,
     export_is_exporting: bool,
     export_progress: f32,
     export_format: ExportFormat,
@@ -64,14 +64,12 @@ struct ParticleStudioApp {
     export_current_frame: usize,
     export_total_frames: usize,
     ffmpeg_available: bool,
-    video_exporter: VideoExporter,
 
     // Adaptive audio
     audio_normalizer: AdaptiveAudioNormalizer,
     normalized_audio: NormalizedAudio,
 
-    // Frame renderer for export
-    frame_renderer: FrameRenderer,
+
 
     // Export thread communication
     export_progress_rx: Option<Receiver<ExportMessage>>,
@@ -86,18 +84,6 @@ struct ParticleStudioApp {
 
     // Status message (text, time_added)
     status_message: Option<(String, std::time::Instant)>,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum ExportFormat {
-    MP4,
-    MOV,
-}
-
-impl Default for ExportFormat {
-    fn default() -> Self {
-        Self::MP4
-    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -153,6 +139,7 @@ impl ParticleStudioApp {
             // Export state
             export_output_path: None,
             export_duration_secs: 10.0,
+            export_start_time_secs: 0.0,
             export_is_exporting: false,
             export_progress: 0.0,
             export_format: ExportFormat::MP4,
@@ -160,12 +147,9 @@ impl ParticleStudioApp {
             export_current_frame: 0,
             export_total_frames: 0,
             ffmpeg_available: VideoExporter::check_ffmpeg_available(),
-            video_exporter: VideoExporter::new(),
             // Adaptive audio
             audio_normalizer: AdaptiveAudioNormalizer::new(3.0, 30),
             normalized_audio: NormalizedAudio::default(),
-            // Frame renderer for export
-            frame_renderer: FrameRenderer::new(1920, 1080),
             // Export thread
             export_progress_rx: None,
             // GPU Export state
@@ -1241,6 +1225,25 @@ impl ParticleStudioApp {
             );
         });
 
+        ui.add_space(6.0);
+        ui.checkbox(
+            &mut self.config.waveform.use_scheme_color,
+            "Use color scheme",
+        );
+        if !self.config.waveform.use_scheme_color {
+            ui.horizontal(|ui| {
+                ui.label("Wave color");
+                let mut c = egui::Color32::from_rgb(
+                    self.config.waveform.color[0],
+                    self.config.waveform.color[1],
+                    self.config.waveform.color[2],
+                );
+                if ui.color_edit_button_srgba(&mut c).changed() {
+                    self.config.waveform.color = [c.r(), c.g(), c.b()];
+                }
+            });
+        }
+
         ui.add_space(8.0);
         ui.label("Thickness");
         ui.add(egui::Slider::new(
@@ -1320,9 +1323,24 @@ impl ParticleStudioApp {
         // Format selection
         ui.horizontal(|ui| {
             ui.label("Format:");
-            ui.selectable_value(&mut self.export_format, ExportFormat::MP4, "MP4");
-            ui.selectable_value(&mut self.export_format, ExportFormat::MOV, "MOV (Alpha)");
+            ui.selectable_value(&mut self.export_format, ExportFormat::MP4, ExportFormat::MP4.name());
+            ui.selectable_value(&mut self.export_format, ExportFormat::MovAlpha, ExportFormat::MovAlpha.name());
+            ui.selectable_value(&mut self.export_format, ExportFormat::WebM, ExportFormat::WebM.name());
+            ui.selectable_value(&mut self.export_format, ExportFormat::PngSequence, ExportFormat::PngSequence.name());
         });
+
+        // PNG sequence export is CPU-only (GPU exporter streams to ffmpeg and does not emit image sequences).
+        if self.export_format == ExportFormat::PngSequence {
+            self.use_gpu_export = false;
+        }
+
+        // Keep file extension in sync when switching formats (for file-based outputs).
+        if self.export_format != ExportFormat::PngSequence {
+            if let Some(ref mut p) = self.export_output_path {
+                p.set_extension(self.export_format.extension());
+            }
+        }
+
 
         // Output file selection
         ui.add_space(8.0);
@@ -1338,16 +1356,24 @@ impl ParticleStudioApp {
                 ui.label("(not selected)");
             }
 
-            if ui.button("📁 Select File").clicked() {
-                let filter = match self.export_format {
-                    ExportFormat::MP4 => ("MP4 Video", "mp4"),
-                    ExportFormat::MOV => ("MOV Video", "mov"),
-                };
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter(filter.0, &[filter.1])
-                    .save_file()
-                {
-                    self.export_output_path = Some(path);
+            if ui.button("📁 Select File/Folder").clicked() {
+                if self.export_format == ExportFormat::PngSequence {
+                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                        self.export_output_path = Some(folder);
+                    }
+                } else {
+                    let filter = match self.export_format {
+                        ExportFormat::MP4 => ("MP4 Video", "mp4"),
+                        ExportFormat::MovAlpha => ("MOV Video", "mov"),
+                        ExportFormat::WebM => ("WebM Video", "webm"),
+                        ExportFormat::PngSequence => ("PNG", "png"),
+                    };
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter(filter.0, &[filter.1])
+                        .save_file()
+                    {
+                        self.export_output_path = Some(path);
+                    }
                 }
             }
         });
@@ -1374,9 +1400,37 @@ impl ParticleStudioApp {
             if ui.button("Full").clicked() {
                 if let Some(duration) = self.audio_sys.get_duration() {
                     self.export_duration_secs = duration;
+                    self.export_start_time_secs = 0.0;
                 }
             }
         });
+
+        // Start time (useful for quick "export what you see" checks)
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Start:");
+            let max_duration = self.audio_sys.get_duration().unwrap_or(86400.0).max(1.0);
+            let max_start = (max_duration - self.export_duration_secs).max(0.0);
+
+            ui.add(
+                egui::DragValue::new(&mut self.export_start_time_secs)
+                    .suffix(" sec")
+                    .clamp_range(0.0..=max_start)
+                    .speed(0.5),
+            );
+
+            if ui.button("From start").clicked() {
+                self.export_start_time_secs = 0.0;
+            }
+
+            if ui.button("Current").clicked() {
+                if let Some(ref analysis) = self.audio_sys.analysis {
+                    let current_time = self.current_frame as f32 / analysis.fps as f32;
+                    self.export_start_time_secs = current_time.clamp(0.0, max_start);
+                }
+            }
+        });
+
 
         // Export controls
         ui.add_space(12.0);
@@ -1445,6 +1499,8 @@ impl ParticleStudioApp {
                                     width: self.config.export.width,
                                     height: self.config.export.height,
                                     fps: self.config.export.fps,
+                                    start_time_secs: self.export_start_time_secs,
+                                    format: self.export_format,
                                     duration_secs: duration,
                                     output_path: path.clone(),
                                     audio_path: self
@@ -1488,12 +1544,18 @@ impl ParticleStudioApp {
                                 let config_clone = self.config.clone();
                                 let analysis_clone = (**analysis).clone();
                                 let path_clone = path.clone();
+                                let audio_path_clone = self.audio_sys.audio_path.clone().map(std::path::PathBuf::from);
+                                let export_format = self.export_format;
+                                let start_time_secs = self.export_start_time_secs;
 
                                 std::thread::spawn(move || {
                                     offscreen_render::run_headless_export(
                                         config_clone,
                                         analysis_clone,
                                         path_clone,
+                                        audio_path_clone,
+                                        export_format,
+                                        start_time_secs,
                                         duration,
                                         tx,
                                     );

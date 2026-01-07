@@ -35,6 +35,7 @@ impl Compositor {
         }
     }
 
+    #[allow(dead_code)]
     pub fn resize(&mut self, width: u32, height: u32) {
         if self.width != width || self.height != height {
             self.width = width;
@@ -74,12 +75,14 @@ impl Compositor {
     }
 
     /// Get buffer as raw bytes (RGB)
+    #[allow(dead_code)]
     pub fn get_buffer_bytes(&self) -> &[u8] {
         self.buffer.as_raw()
     }
 
     /// Convert egui texture to buffer for post-processing
     /// This is used when we need to capture the egui render and apply effects
+    #[allow(dead_code)]
     pub fn copy_from_pixels(&mut self, pixels: &[u8], width: u32, height: u32) {
         if width != self.width || height != self.height {
             self.resize(width, height);

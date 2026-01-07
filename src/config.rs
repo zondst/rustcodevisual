@@ -753,6 +753,10 @@ impl Default for VisualConfig {
 pub struct WaveformConfig {
     pub enabled: bool,
     pub style: WaveformStyle,
+    #[serde(default)]
+    pub use_scheme_color: bool,
+    #[serde(default)]
+    pub color: [u8; 3],
     pub thickness: f32,
     pub amplitude: f32,
     pub position_x: f32,
@@ -767,6 +771,8 @@ impl Default for WaveformConfig {
         Self {
             enabled: true,
             style: WaveformStyle::Line,
+            use_scheme_color: true,
+            color: [0, 200, 255],
             thickness: 3.0,
             amplitude: 200.0,
             position_x: 0.5,
